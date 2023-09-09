@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/viper"
+	"github.com/weedbox/common-modules/database"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 	"gorm.io/driver/postgres"
@@ -36,10 +37,10 @@ type Params struct {
 
 func Module(scope string) fx.Option {
 
-	var c *PostgresConnector
+	var dc database.DatabaseConnector
 
 	return fx.Options(
-		fx.Provide(func(p Params) *PostgresConnector {
+		fx.Provide(func(p Params) database.DatabaseConnector {
 
 			c := &PostgresConnector{
 				params: p,
@@ -49,8 +50,10 @@ func Module(scope string) fx.Option {
 
 			return c
 		}),
-		fx.Populate(&c),
+		fx.Populate(&dc),
 		fx.Invoke(func(p Params) {
+
+			c := dc.(*PostgresConnector)
 
 			p.Lifecycle.Append(
 				fx.Hook{
