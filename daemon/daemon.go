@@ -8,11 +8,20 @@ import (
 	"go.uber.org/zap"
 )
 
+type HealthStatus int32
+
+const (
+	HealthStatus_Healthy HealthStatus = iota
+	HealthStatus_Unhealthy
+)
+
 var logger *zap.Logger
 
 type Daemon struct {
-	logger *zap.Logger
-	scope  string
+	logger       *zap.Logger
+	scope        string
+	isReady      bool
+	healthStatus HealthStatus
 }
 
 type Params struct {
@@ -32,8 +41,10 @@ func Module(scope string) fx.Option {
 			logger = p.Logger.Named(scope)
 
 			d := &Daemon{
-				logger: logger,
-				scope:  scope,
+				logger:       logger,
+				scope:        scope,
+				isReady:      false,
+				healthStatus: HealthStatus_Healthy,
 			}
 
 			return d
@@ -61,6 +72,7 @@ func (d *Daemon) getConfigPath(key string) string {
 func (d *Daemon) onStart(ctx context.Context) error {
 
 	logger.Info("Starting daemon")
+	d.isReady = true
 
 	return nil
 }
@@ -68,6 +80,15 @@ func (d *Daemon) onStart(ctx context.Context) error {
 func (d *Daemon) onStop(ctx context.Context) error {
 
 	logger.Info("Stopped daemon")
+	d.isReady = false
 
 	return nil
+}
+
+func (d *Daemon) Ready() bool {
+	return d.isReady
+}
+
+func (d *Daemon) GetHealthStatus() HealthStatus {
+	return d.healthStatus
 }
