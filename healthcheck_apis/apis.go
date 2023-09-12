@@ -30,7 +30,8 @@ func Module(scope string) fx.Option {
 
 	var a *APIs
 
-	return fx.Options(
+	return fx.Module(
+		scope,
 		fx.Provide(func(p Params) *APIs {
 
 			a := &APIs{

@@ -37,16 +37,23 @@ type Params struct {
 
 func Module(scope string) fx.Option {
 
-	return fx.Options(
+	var c *NATSConnector
 
-		fx.Invoke(func(p Params) *NATSConnector {
+	return fx.Module(
+		scope,
+		fx.Provide(func(p Params) *NATSConnector {
 
 			logger = p.Logger.Named(scope)
 
-			c := &NATSConnector{
+			hs := &NATSConnector{
 				logger: logger,
 				scope:  scope,
 			}
+
+			return hs
+		}),
+		fx.Populate(&c),
+		fx.Invoke(func(p Params) {
 
 			p.Lifecycle.Append(
 				fx.Hook{
@@ -54,11 +61,8 @@ func Module(scope string) fx.Option {
 					OnStop:  c.onStop,
 				},
 			)
-
-			return c
 		}),
 	)
-
 }
 
 func (c *NATSConnector) getConfigPath(key string) string {

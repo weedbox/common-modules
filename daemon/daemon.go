@@ -35,7 +35,8 @@ func Module(scope string) fx.Option {
 
 	var d *Daemon
 
-	return fx.Options(
+	return fx.Module(
+		scope,
 		fx.Provide(func(p Params) *Daemon {
 
 			logger = p.Logger.Named(scope)

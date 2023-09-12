@@ -39,7 +39,8 @@ func Module(scope string) fx.Option {
 
 	var dc database.DatabaseConnector
 
-	return fx.Options(
+	return fx.Module(
+		scope,
 		fx.Provide(func(p Params) database.DatabaseConnector {
 
 			c := &PostgresConnector{

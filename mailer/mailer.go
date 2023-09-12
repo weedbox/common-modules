@@ -30,7 +30,8 @@ func Module(scope string) fx.Option {
 
 	var m *Mailer
 
-	return fx.Options(
+	return fx.Module(
+		scope,
 		fx.Provide(func(p Params) *Mailer {
 
 			logger = p.Logger.Named(scope)

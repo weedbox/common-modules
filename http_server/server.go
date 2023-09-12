@@ -32,7 +32,8 @@ func Module(scope string) fx.Option {
 
 	var hs *HTTPServer
 
-	return fx.Options(
+	return fx.Module(
+		scope,
 		fx.Provide(func(p Params) *HTTPServer {
 
 			logger = p.Logger.Named(scope)
