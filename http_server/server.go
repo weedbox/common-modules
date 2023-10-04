@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+	"strings"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/viper"
 	"go.uber.org/fx"
@@ -80,11 +82,40 @@ func (hs *HTTPServer) onStart(ctx context.Context) error {
 	host := viper.GetString(hs.getConfigPath("host"))
 	addr := fmt.Sprintf("%s:%d", host, port)
 
+	allowOrigins := viper.GetString(hs.getConfigPath("allow_origins"))
+	allowMethods := viper.GetString(hs.getConfigPath("allow_methods"))
+	allowHeaders := viper.GetString(hs.getConfigPath("allow_headers"))
+
 	logger.Info("Starting HTTPServer",
 		zap.String("address", addr),
 	)
 
 	hs.router = gin.Default()
+
+	// Setup Cors
+	corsConfig := cors.DefaultConfig()
+
+	if allowOrigins != "" {
+		allows := strings.Split(allowOrigins, ",")
+		for _, a := range allows {
+			corsConfig.AllowOrigins = append(corsConfig.AllowOrigins, a)
+		}
+	} else {
+		corsConfig.AllowAllOrigins = true
+	}
+	if allowMethods != "" {
+		allows := strings.Split(allowMethods, ",")
+		for _, a := range allows {
+			corsConfig.AllowMethods = append(corsConfig.AllowMethods, a)
+		}
+	}
+	if allowHeaders != "" {
+		allows := strings.Split(allowHeaders, ",")
+		for _, a := range allows {
+			corsConfig.AllowHeaders = append(corsConfig.AllowHeaders, a)
+		}
+	}
+	hs.router.Use(cors.New(corsConfig))
 
 	hs.server = &http.Server{
 		Addr:    addr,
