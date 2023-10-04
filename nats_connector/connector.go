@@ -50,6 +50,8 @@ func Module(scope string) fx.Option {
 				scope:  scope,
 			}
 
+			hs.initDefaultConfigs()
+
 			return hs
 		}),
 		fx.Populate(&c),
@@ -69,13 +71,14 @@ func (c *NATSConnector) getConfigPath(key string) string {
 	return fmt.Sprintf("%s.%s", c.scope, key)
 }
 
-func (c *NATSConnector) onStart(ctx context.Context) error {
-
-	// default settings
+func (c *NATSConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("host"), DefaultHost)
 	viper.SetDefault(c.getConfigPath("pingInterval"), DefaultPingInterval)
 	viper.SetDefault(c.getConfigPath("maxPingsOutstanding"), DefaultMaxPingsOutstanding)
 	viper.SetDefault(c.getConfigPath("maxReconnects"), DefaultMaxReconnects)
+}
+
+func (c *NATSConnector) onStart(ctx context.Context) error {
 
 	// Prparing configurations
 	host := viper.GetString(c.getConfigPath("host"))

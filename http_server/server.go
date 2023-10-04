@@ -12,6 +12,11 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	DefaultHost = "0.0.0.0"
+	DefaultPort = 80
+)
+
 var logger *zap.Logger
 
 type HTTPServer struct {
@@ -43,6 +48,8 @@ func Module(scope string) fx.Option {
 				scope:  scope,
 			}
 
+			hs.initDefaultConfigs()
+
 			return hs
 		}),
 		fx.Populate(&hs),
@@ -60,6 +67,11 @@ func Module(scope string) fx.Option {
 
 func (hs *HTTPServer) getConfigPath(key string) string {
 	return fmt.Sprintf("%s.%s", hs.scope, key)
+}
+
+func (hs *HTTPServer) initDefaultConfigs() {
+	viper.SetDefault(hs.getConfigPath("host"), DefaultHost)
+	viper.SetDefault(hs.getConfigPath("port"), DefaultPort)
 }
 
 func (hs *HTTPServer) onStart(ctx context.Context) error {

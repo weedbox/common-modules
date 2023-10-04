@@ -11,6 +11,14 @@ import (
 	"gopkg.in/gomail.v2"
 )
 
+const (
+	DefaultHost     = "0.0.0.0"
+	DefaultPort     = 25
+	DefaultUsername = ""
+	DefaultPassword = ""
+	DefaultTLS      = false
+)
+
 var logger *zap.Logger
 
 type Mailer struct {
@@ -41,6 +49,8 @@ func Module(scope string) fx.Option {
 				scope:  scope,
 			}
 
+			m.initDefaultConfigs()
+
 			return m
 		}),
 		fx.Populate(&m),
@@ -61,6 +71,14 @@ func Module(scope string) fx.Option {
 
 func (m *Mailer) getConfigPath(key string) string {
 	return fmt.Sprintf("%s.%s", m.scope, key)
+}
+
+func (m *Mailer) initDefaultConfigs() {
+	viper.SetDefault(m.getConfigPath("host"), DefaultHost)
+	viper.SetDefault(m.getConfigPath("port"), DefaultPort)
+	viper.SetDefault(m.getConfigPath("tls"), DefaultTLS)
+	viper.SetDefault(m.getConfigPath("password"), DefaultPassword)
+	viper.SetDefault(m.getConfigPath("password"), DefaultPassword)
 }
 
 func (m *Mailer) onStart(ctx context.Context) error {

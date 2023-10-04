@@ -49,6 +49,8 @@ func Module(scope string) fx.Option {
 				scope:  scope,
 			}
 
+			c.initDefaultConfigs()
+
 			return c
 		}),
 		fx.Populate(&dc),
@@ -71,15 +73,16 @@ func (c *PostgresConnector) getConfigPath(key string) string {
 	return fmt.Sprintf("%s.%s", c.scope, key)
 }
 
-func (c *PostgresConnector) onStart(ctx context.Context) error {
-
-	// default settings
+func (c *PostgresConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("host"), DefaultHost)
 	viper.SetDefault(c.getConfigPath("port"), DefaultPort)
 	viper.SetDefault(c.getConfigPath("dbname"), DefaultDbName)
 	viper.SetDefault(c.getConfigPath("user"), DefaultUser)
 	viper.SetDefault(c.getConfigPath("password"), DefaultPassword)
 	viper.SetDefault(c.getConfigPath("sslmode"), DefaultSSLMode)
+}
+
+func (c *PostgresConnector) onStart(ctx context.Context) error {
 
 	sslmode := "disable"
 	if viper.GetBool(c.getConfigPath("sslmode")) {
