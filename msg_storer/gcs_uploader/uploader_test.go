@@ -192,8 +192,7 @@ func (s *TestSuite) TestStartSubscriber() {
 	go func() {
 		// 在这里模拟 QueueSubscribe 和消息处理的逻辑
 		//s.T().Log("subscribe subject: ", subject)
-		_, err := js.QueueSubscribe(subject,
-			"msg-store-archive-group",
+		_, err := js.Subscribe(subject,
 			func(m *nats.Msg) {
 				s.Equal(exp, string(m.Data), "result should be %s", exp)
 
@@ -201,7 +200,6 @@ func (s *TestSuite) TestStartSubscriber() {
 				m.Ack()
 				wg.Done()
 			},
-			nats.Durable("msg-store"),
 			nats.ManualAck(),
 		)
 		if err != nil {

@@ -118,10 +118,8 @@ func (u *Uploader) startSubscriber() error {
 	subject := fmt.Sprintf(DefaultSubject, u.domain, u.hostname)
 	go func() {
 		//u.logger.Info(subject)
-		_, err := js.QueueSubscribe(subject,
-			"msg-store-archive-group",
+		_, err := js.Subscribe(subject,
 			u.msgHandler,
-			nats.Durable("msg-store-archive"),
 			nats.ManualAck(),
 		)
 		if err != nil {
