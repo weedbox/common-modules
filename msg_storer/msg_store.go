@@ -108,7 +108,7 @@ func (sr *Storer) onStart(ctx context.Context) error {
 	_, err = js.AddStream(
 		&nats.StreamConfig{
 			Name:       fmt.Sprintf("%s_Archive_Job", sr.domain),
-			Subjects:   []string{fmt.Sprintf(DefaultSubject, sr.domain, "*")},
+			Subjects:   []string{fmt.Sprintf(DefaultSubject, sr.domain, ">")},
 			Retention:  nats.WorkQueuePolicy,
 			Storage:    nats.FileStorage,
 			Replicas:   1,
