@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	gorm_logger "gorm.io/gorm/logger"
 )
 
 const (
@@ -19,6 +20,7 @@ const (
 	DefaultUser     = "postgres"
 	DefaultPassword = ""
 	DefaultSSLMode  = false
+	DefaultLogLevel = gorm_logger.Error
 )
 
 type PostgresConnector struct {
@@ -80,6 +82,7 @@ func (c *PostgresConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("user"), DefaultUser)
 	viper.SetDefault(c.getConfigPath("password"), DefaultPassword)
 	viper.SetDefault(c.getConfigPath("sslmode"), DefaultSSLMode)
+	viper.SetDefault(c.getConfigPath("loglevel"), DefaultLogLevel)
 }
 
 func (c *PostgresConnector) onStart(ctx context.Context) error {
@@ -102,9 +105,14 @@ func (c *PostgresConnector) onStart(ctx context.Context) error {
 		zap.String("host", viper.GetString(c.getConfigPath("host"))),
 		zap.Int("port", viper.GetInt(c.getConfigPath("port"))),
 		zap.String("dbname", viper.GetString(c.getConfigPath("dbname"))),
+		zap.Int("loglevel", viper.GetInt(c.getConfigPath("loglevel"))),
 	)
 
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	opts := &gorm.Config{
+		Logger: gorm_logger.Default.LogMode(gorm_logger.LogLevel(viper.GetInt(c.getConfigPath("loglevel")))),
+	}
+
+	db, err := gorm.Open(postgres.Open(dsn), opts)
 	if err != nil {
 		return err
 	}
