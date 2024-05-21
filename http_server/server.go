@@ -96,11 +96,15 @@ func (hs *HTTPServer) onStart(ctx context.Context) error {
 		gin.SetMode(gin.TestMode)
 	}
 
-	if logLevel == "release" {
+	if logLevel == "release" || logLevel = "prod" {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
 	hs.router = gin.Default()
+
+	if logLevel = "prod" {
+		hs.router = gin.New()
+	}
 
 	// Setup Cors
 	corsConfig := cors.DefaultConfig()
