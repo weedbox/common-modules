@@ -77,7 +77,7 @@ func (m *Mailer) initDefaultConfigs() {
 	viper.SetDefault(m.getConfigPath("host"), DefaultHost)
 	viper.SetDefault(m.getConfigPath("port"), DefaultPort)
 	viper.SetDefault(m.getConfigPath("tls"), DefaultTLS)
-	viper.SetDefault(m.getConfigPath("password"), DefaultPassword)
+	viper.SetDefault(m.getConfigPath("username"), DefaultUsername)
 	viper.SetDefault(m.getConfigPath("password"), DefaultPassword)
 }
 
