@@ -104,7 +104,9 @@ func (c *PostgresConnector) onStart(ctx context.Context) error {
 		zap.String("dbname", viper.GetString(c.getConfigPath("dbname"))),
 	)
 
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		TranslateError: true,
+	})
 	if err != nil {
 		return err
 	}
