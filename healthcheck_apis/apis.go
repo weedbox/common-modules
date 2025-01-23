@@ -63,7 +63,7 @@ func (a *APIs) onStart(ctx context.Context) error {
 	router := a.params.HTTPServer.GetRouter()
 
 	router.GET("/healthz", a.healthz)
-	router.GET("/ready", a.healthz)
+	router.GET("/ready", a.ready)
 
 	return nil
 }
