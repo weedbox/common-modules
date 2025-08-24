@@ -2,6 +2,7 @@ package configs
 
 import (
 	"fmt"
+	"log"
 	"reflect"
 	"runtime"
 	"strings"
@@ -25,7 +26,14 @@ func NewConfig(prefix string) *Config {
 	viper.AddConfigPath("./configs")
 
 	if err := viper.ReadInConfig(); err != nil {
-		fmt.Println("No configuration file was loaded")
+		switch err.(type) {
+		// check config file format valid or not
+		case viper.ConfigParseError:
+			log.Fatal("configuration format error")
+		default:
+			fmt.Println("no configuration file was loaded")
+		}
+
 	}
 
 	runtime.GOMAXPROCS(8)
