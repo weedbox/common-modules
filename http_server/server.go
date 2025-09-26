@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
 	"strings"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -15,8 +15,12 @@ import (
 )
 
 const (
-	DefaultHost = "0.0.0.0"
-	DefaultPort = 80
+	DefaultHost    = "0.0.0.0"
+	DefaultPort    = 80
+	DefaultHeaders = "Authorization,Accept"
+	DefaultMethods = ""
+	DefaultOrigins = ""
+	DefaultMode = "test" // e.g. test, prod
 )
 
 var logger *zap.Logger
@@ -74,6 +78,13 @@ func (hs *HTTPServer) getConfigPath(key string) string {
 func (hs *HTTPServer) initDefaultConfigs() {
 	viper.SetDefault(hs.getConfigPath("host"), DefaultHost)
 	viper.SetDefault(hs.getConfigPath("port"), DefaultPort)
+	viper.SetDefault(hs.getConfigPath("mode"), DefaultMode)
+
+
+	viper.SetDefault(hs.getConfigPath("allow_origins"), DefaultOrigins)
+	viper.SetDefault(hs.getConfigPath("allow_methods"), DefaultMethods)
+	viper.SetDefault(hs.getConfigPath("allow_headers"), DefaultHeaders)
+
 }
 
 func (hs *HTTPServer) onStart(ctx context.Context) error {
@@ -81,6 +92,8 @@ func (hs *HTTPServer) onStart(ctx context.Context) error {
 	port := viper.GetInt(hs.getConfigPath("port"))
 	host := viper.GetString(hs.getConfigPath("host"))
 	addr := fmt.Sprintf("%s:%d", host, port)
+
+	mode := viper.GetString(hs.getConfigPath("mode"))
 
 	logLevel := viper.GetString(hs.getConfigPath("loglevel"))
 
@@ -123,12 +136,15 @@ func (hs *HTTPServer) onStart(ctx context.Context) error {
 			corsConfig.AllowMethods = append(corsConfig.AllowMethods, a)
 		}
 	}
-	if allowHeaders != "" {
+
+	// Add default or custom headers if in testing mode
+	if mode == "test" {
 		allows := strings.Split(allowHeaders, ",")
 		for _, a := range allows {
 			corsConfig.AllowHeaders = append(corsConfig.AllowHeaders, a)
 		}
 	}
+
 	hs.router.Use(cors.New(corsConfig))
 
 	hs.server = &http.Server{
