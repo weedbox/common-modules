@@ -1,10 +1,10 @@
 package logger
 
 import (
-	"fmt"
 	"os"
 
 	"go.uber.org/fx"
+	"go.uber.org/fx/fxevent"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -18,6 +18,9 @@ type Params struct {
 func Module() fx.Option {
 	return fx.Options(
 		fx.Provide(SetupLogger),
+		fx.WithLogger(func(l *zap.Logger) fxevent.Logger {
+			return &fxevent.ZapLogger{Logger: l}
+		}),
 	)
 }
 
@@ -40,6 +43,7 @@ func NewCustomEncoderConfig() zapcore.EncoderConfig {
 
 func SetupLogger() *zap.Logger {
 	debugLevel := setupLevel()
+
 	core := zapcore.NewCore(
 		zapcore.NewConsoleEncoder(NewCustomEncoderConfig()),
 		zapcore.NewMultiWriteSyncer(zapcore.AddSync(os.Stdout)),
@@ -47,7 +51,6 @@ func SetupLogger() *zap.Logger {
 	)
 
 	if os.Getenv("DEBUG_MODE") == "debug" {
-		logger.Info(fmt.Sprintf("Debug mode is set to \"%s\"\n", debugLevel.String()))
 		logger = zap.New(core, zap.AddCaller(), zap.Development())
 	} else {
 		logger = zap.New(core)
@@ -55,7 +58,7 @@ func SetupLogger() *zap.Logger {
 
 	zap.ReplaceGlobals(logger)
 
-	logger.Info(fmt.Sprintf("Debug level is set to \"%s\"\n", debugLevel.String()))
+	logger.Info("Logger initialized", zap.String("level", debugLevel.String()))
 
 	return logger
 }
