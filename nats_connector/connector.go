@@ -144,6 +144,46 @@ func (c *NATSConnector) onStop(ctx context.Context) error {
 	return nil
 }
 
+func (c *NATSConnector) NewWorkQueueConsumer(streamName string, cfg WorkQueueConfig) (*WorkQueueConsumer, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("nats connection not initialized")
+	}
+
+	if cfg.Conn == nil {
+		cfg.Conn = c.conn
+	}
+
+	if len(cfg.Subjects) == 0 {
+		cfg.Subjects = []string{"work_queue"}
+	}
+
+	if cfg.MaxConcurrent <= 0 {
+		cfg.MaxConcurrent = DefaultMaxConcurrent
+	}
+	if cfg.AckWait <= 0 {
+		cfg.AckWait = DefaultAckWait
+	}
+	if cfg.MaxAckPending <= 0 {
+		cfg.MaxAckPending = DefaultMaxAckPending
+	}
+
+	if cfg.Stream == nil {
+		if streamName == "" {
+			return nil, fmt.Errorf("stream name is required when stream info is not provided")
+		}
+		if c.js == nil {
+			return nil, fmt.Errorf("jetstream context not initialized")
+		}
+		info, err := c.js.StreamInfo(streamName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load stream info for %s: %w", streamName, err)
+		}
+		cfg.Stream = info
+	}
+
+	return NewWorkQueueConsumer(cfg)
+}
+
 func (c *NATSConnector) GetConnection() *nats.Conn {
 	return c.conn
 }
