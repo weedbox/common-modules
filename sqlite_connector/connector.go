@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	DefaultPath     = "./data.db"
-	DefaultLogLevel = gorm_logger.Error
+	DefaultPath      = "./data.db"
+	DefaultLogLevel  = gorm_logger.Error
+	DefaultDebugMode = false
 )
 
 type SQLiteConnector struct {
@@ -66,6 +67,7 @@ func (c *SQLiteConnector) getConfigPath(key string) string {
 func (c *SQLiteConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("path"), DefaultPath)
 	viper.SetDefault(c.getConfigPath("loglevel"), DefaultLogLevel)
+	viper.SetDefault(c.getConfigPath("debug_mode"), DefaultDebugMode)
 }
 
 func (c *SQLiteConnector) onStart(ctx context.Context) error {
@@ -94,6 +96,10 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 	db, err := gorm.Open(sqlite.Open(dbPath), opts)
 	if err != nil {
 		return err
+	}
+
+	if viper.GetBool(c.getConfigPath("debug_mode")) {
+		db = db.Debug()
 	}
 
 	c.db = db
