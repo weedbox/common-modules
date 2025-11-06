@@ -2,6 +2,7 @@ package logger
 
 import (
 	"os"
+	"strings"
 
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
@@ -42,7 +43,8 @@ func NewCustomEncoderConfig() zapcore.EncoderConfig {
 }
 
 func SetupLogger() *zap.Logger {
-	debugLevel := setupLevel()
+	debugMode := isDebugMode()
+	debugLevel := setupLevel(debugMode)
 
 	core := zapcore.NewCore(
 		zapcore.NewConsoleEncoder(NewCustomEncoderConfig()),
@@ -50,7 +52,7 @@ func SetupLogger() *zap.Logger {
 		debugLevel,
 	)
 
-	if os.Getenv("DEBUG_MODE") == "debug" {
+	if debugMode {
 		logger = zap.New(core, zap.AddCaller(), zap.Development())
 	} else {
 		logger = zap.New(core)
@@ -67,10 +69,13 @@ func GetLogger() *zap.Logger {
 	return logger
 }
 
-func setupLevel() zap.AtomicLevel {
+func setupLevel(debugMode bool) zap.AtomicLevel {
+	if !debugMode {
+		return zap.NewAtomicLevelAt(zap.InfoLevel)
+	}
 
 	debugLevel := zap.DebugLevel
-	switch os.Getenv("DEBUG_LEVEL") {
+	switch strings.ToLower(os.Getenv("DEBUG_LEVEL")) {
 	case zap.InfoLevel.String():
 		debugLevel = zap.InfoLevel
 	case zap.WarnLevel.String():
@@ -86,4 +91,13 @@ func setupLevel() zap.AtomicLevel {
 	}
 
 	return zap.NewAtomicLevelAt(debugLevel)
+}
+
+func isDebugMode() bool {
+	switch strings.ToLower(os.Getenv("DEBUG_MODE")) {
+	case "debug", "true":
+		return true
+	default:
+		return false
+	}
 }
