@@ -3,6 +3,9 @@ package postgres_connector
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"time"
 
 	"github.com/spf13/viper"
 	"github.com/weedbox/common-modules/database"
@@ -110,18 +113,36 @@ func (c *PostgresConnector) onStart(ctx context.Context) error {
 		zap.Int("loglevel", viper.GetInt(c.getConfigPath("loglevel"))),
 	)
 
+	// Default logger configuration
+	loggerCfg := gorm_logger.Config{
+		SlowThreshold:             200 * time.Millisecond,
+		LogLevel:                  gorm_logger.LogLevel(viper.GetInt(c.getConfigPath("loglevel"))),
+		IgnoreRecordNotFoundError: true,
+		ParameterizedQueries:      false,
+		Colorful:                  false,
+	}
+
+	if viper.GetBool(c.getConfigPath("debug_mode")) {
+		loggerCfg.LogLevel = gorm_logger.Info
+		loggerCfg.ParameterizedQueries = true
+		loggerCfg.Colorful = true
+		loggerCfg.IgnoreRecordNotFoundError = false // Show RecordNotFound in debug mode
+	}
+
+	// Create logger based on Default config but with IgnoreRecordNotFoundError enabled
+	gormLogger := gorm_logger.New(
+		log.New(os.Stdout, "\r\n", log.LstdFlags), // Same as Default
+		loggerCfg,
+	)
+
 	opts := &gorm.Config{
-		Logger:         gorm_logger.Default.LogMode(gorm_logger.LogLevel(viper.GetInt(c.getConfigPath("loglevel")))),
+		Logger:         gormLogger,
 		TranslateError: true,
 	}
 
 	db, err := gorm.Open(postgres.Open(dsn), opts)
 	if err != nil {
 		return err
-	}
-
-	if viper.GetBool(c.getConfigPath("debug_mode")) {
-		db = db.Debug()
 	}
 
 	c.db = db
