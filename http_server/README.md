@@ -247,10 +247,6 @@ Static file serving features:
 | `release` | ReleaseMode | For production, reduced log output |
 | `prod` | ReleaseMode | For production, uses minimal Gin instance (no default middleware) |
 
-## Example Project
-
-See [service-boilerplate](https://github.com/weedbox/service-boilerplate) for a complete application example.
-
 ## License
 
 Apache License 2.0
