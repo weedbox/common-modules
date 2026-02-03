@@ -24,6 +24,7 @@ go get github.com/weedbox/common-modules
 |--------|-------------|
 | [http_server](./http_server) | Gin-based HTTP server with CORS support |
 | [healthcheck_apis](./healthcheck_apis) | Kubernetes-compatible health check endpoints (`/healthz`, `/ready`) |
+| [swagger](./swagger) | Swagger/OpenAPI documentation with Scalar UI |
 
 ### Database
 
