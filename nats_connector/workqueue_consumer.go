@@ -96,6 +96,7 @@ func (wqc *WorkQueueConsumer) ensureConsumer(config WorkQueueConfig) error {
 	// Consumer configuration
 	consumerConfig := jetstream.ConsumerConfig{
 		Name:           config.ConsumerName,
+		Durable:        config.ConsumerName,          // Make consumer durable to survive subscription disconnects
 		FilterSubjects: config.Subjects,
 		AckPolicy:      jetstream.AckExplicitPolicy, // Require explicit ack
 		AckWait:        config.AckWait,              // Set ack wait time
