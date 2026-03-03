@@ -167,6 +167,15 @@ func (c *NATSConnector) NewWorkQueueConsumer(streamName string, cfg WorkQueueCon
 		cfg.MaxAckPending = DefaultMaxAckPending
 	}
 
+	if cfg.MaxRestarts != 0 || cfg.RestartBaseDelay != 0 || cfg.RestartMaxDelay != 0 {
+		if cfg.RestartBaseDelay <= 0 {
+			cfg.RestartBaseDelay = DefaultRestartBaseDelay
+		}
+		if cfg.RestartMaxDelay <= 0 {
+			cfg.RestartMaxDelay = DefaultRestartMaxDelay
+		}
+	}
+
 	if cfg.Stream == nil {
 		if streamName == "" {
 			return nil, fmt.Errorf("stream name is required when stream info is not provided")

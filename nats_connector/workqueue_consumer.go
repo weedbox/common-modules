@@ -23,6 +23,11 @@ const (
 	DefaultAckWait       = 30 * time.Second // Default ack wait time
 	DefaultMaxRetries    = -1               // Default maximum retries for message processing (negative means unlimited)
 	DefaultMaxAckPending = DefaultMaxConcurrent
+
+	// Default values for restart configuration
+	DefaultMaxRestarts      = -1              // Unlimited restarts
+	DefaultRestartBaseDelay = 1 * time.Second
+	DefaultRestartMaxDelay  = 30 * time.Second
 )
 
 type WorkQueueConsumer struct {
@@ -43,8 +48,11 @@ type WorkQueueConfig struct {
 	MaxConcurrent int
 	AckWait       time.Duration // Set ack wait time to prevent duplicate processing
 	MaxRetries    int
-	MaxAckPending int
-	OnError       ErrorHandler
+	MaxAckPending    int
+	OnError          ErrorHandler
+	MaxRestarts      int           // Max restart attempts; -1 unlimited, 0 no restart
+	RestartBaseDelay time.Duration // Restart backoff base delay (default 1s)
+	RestartMaxDelay  time.Duration // Restart backoff max delay (default 30s)
 }
 
 func init() {
@@ -60,8 +68,11 @@ func NewWorkQueueConsumerConfig() WorkQueueConfig {
 		MaxConcurrent: DefaultMaxConcurrent,
 		AckWait:       DefaultAckWait,
 		MaxRetries:    DefaultMaxRetries, // Default to unlimited retries
-		MaxAckPending: DefaultMaxAckPending,
-		OnError:       nil,
+		MaxAckPending:    DefaultMaxAckPending,
+		OnError:          nil,
+		MaxRestarts:      DefaultMaxRestarts,
+		RestartBaseDelay: DefaultRestartBaseDelay,
+		RestartMaxDelay:  DefaultRestartMaxDelay,
 	}
 }
 
@@ -204,6 +215,11 @@ func (wqc *WorkQueueConsumer) processMessage(msg jetstream.Msg, handler MessageH
 	done := make(chan error, 1)
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("handler panic: %v", r)
+			}
+		}()
 		done <- handler(processCtx, msg)
 	}()
 
@@ -296,4 +312,86 @@ func (wqc *WorkQueueConsumer) Shutdown() {
 
 	// Wait for all goroutines to complete
 	wqc.wg.Wait()
+}
+
+// Done returns a channel that is closed when the consumer context is cancelled.
+func (wqc *WorkQueueConsumer) Done() <-chan struct{} {
+	return wqc.ctx.Done()
+}
+
+func (wqc *WorkQueueConsumer) restartDelay(attempt int) time.Duration {
+	baseDelay := wqc.config.RestartBaseDelay
+	if baseDelay <= 0 {
+		baseDelay = DefaultRestartBaseDelay
+	}
+	maxDelay := wqc.config.RestartMaxDelay
+	if maxDelay <= 0 {
+		maxDelay = DefaultRestartMaxDelay
+	}
+
+	delay := baseDelay * time.Duration(1<<(attempt-1))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+
+	jitterRange := delay / 5
+	if jitterRange < time.Millisecond {
+		jitterRange = time.Millisecond
+	}
+	jitter := time.Duration(rand.Int63n(int64(jitterRange)))
+
+	finalDelay := delay + jitter
+	if finalDelay <= 0 {
+		finalDelay = baseDelay
+	}
+	return finalDelay
+}
+
+// StartWithRestart runs the consumer with automatic restart on failure.
+// It blocks until the consumer is shut down or max restarts is exceeded.
+func (wqc *WorkQueueConsumer) StartWithRestart(handler MessageHandler) error {
+	attempt := 0
+	for {
+		attempt++
+		startErr := func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("consumer panic: %v", r)
+				}
+			}()
+			return wqc.Start(handler)
+		}()
+
+		// Normal shutdown → don't restart
+		select {
+		case <-wqc.ctx.Done():
+			return nil
+		default:
+		}
+
+		// Report via ErrorHandler
+		if startErr != nil {
+			wqc.handleError(fmt.Errorf("consumer stopped with error (attempt %d): %w", attempt, startErr))
+		} else {
+			wqc.handleError(fmt.Errorf("consumer stopped unexpectedly (attempt %d)", attempt))
+		}
+
+		// Check restart limit
+		maxRestarts := wqc.config.MaxRestarts
+		if maxRestarts == 0 {
+			return fmt.Errorf("consumer stopped, restarts disabled")
+		}
+		if maxRestarts > 0 && attempt >= maxRestarts {
+			return fmt.Errorf("consumer exceeded max restarts (%d)", maxRestarts)
+		}
+
+		// Exponential backoff wait
+		delay := wqc.restartDelay(attempt)
+		wqc.handleError(fmt.Errorf("restarting consumer in %s (attempt %d)", delay, attempt))
+		select {
+		case <-time.After(delay):
+		case <-wqc.ctx.Done():
+			return nil
+		}
+	}
 }

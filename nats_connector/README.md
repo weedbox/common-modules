@@ -8,6 +8,7 @@ A NATS messaging connector module built on [NATS Go Client](https://github.com/n
 - NATS core messaging support
 - JetStream support for persistent messaging
 - Work queue consumer with concurrency control
+- Automatic panic recovery and consumer restart with exponential backoff
 - Authentication support (credentials, NKey)
 - TLS support
 - Automatic reconnection
@@ -142,6 +143,32 @@ func (w *Worker) StartAsyncConsumer() error {
 
     return err
 }
+
+func (w *Worker) StartConsumerWithRestart() error {
+    config := nats_connector.NewWorkQueueConsumerConfig()
+    config.ConsumerName = "my-worker"
+    config.Subjects = []string{"tasks.>"}
+    config.MaxConcurrent = 10
+    config.MaxRestarts = -1               // -1 = unlimited, 0 = no restart, N = max N restarts
+    config.RestartBaseDelay = time.Second  // base delay for exponential backoff
+    config.RestartMaxDelay = 30 * time.Second
+    config.OnError = func(err error) {
+        log.Printf("Error: %v", err)
+    }
+
+    consumer, err := w.params.NATS.NewWorkQueueConsumer("my-stream", config)
+    if err != nil {
+        return err
+    }
+
+    // Start consuming with automatic restart (blocking)
+    // Panics in handlers are recovered and treated as errors.
+    // If the consumer crashes, it restarts with exponential backoff.
+    return consumer.StartWithRestart(func(ctx context.Context, msg jetstream.Msg) error {
+        // Process message
+        return nil
+    })
+}
 ```
 
 ## Configuration
@@ -222,9 +249,17 @@ Starts consuming messages synchronously (blocking).
 
 Starts consuming messages asynchronously (non-blocking).
 
+#### `StartWithRestart(handler MessageHandler) error`
+
+Starts consuming with automatic restart on failure (blocking). Panics in handlers are recovered and converted to errors. If the consumer crashes, it restarts with exponential backoff. Respects `MaxRestarts`, `RestartBaseDelay`, and `RestartMaxDelay` from config.
+
 #### `Shutdown()`
 
-Gracefully shuts down the consumer.
+Gracefully shuts down the consumer. Also interrupts any pending restart backoff wait.
+
+#### `Done() <-chan struct{}`
+
+Returns a channel that is closed when the consumer context is cancelled.
 
 ### WorkQueueConfig
 
@@ -237,8 +272,11 @@ type WorkQueueConfig struct {
     MaxConcurrent int              // Max concurrent message processing (default: 10)
     AckWait       time.Duration    // Ack wait time (default: 30s)
     MaxRetries    int              // Max retries (-1 = unlimited)
-    MaxAckPending int              // Max pending acks (default: MaxConcurrent)
-    OnError       ErrorHandler     // Error handler callback
+    MaxAckPending    int              // Max pending acks (default: MaxConcurrent)
+    OnError          ErrorHandler     // Error handler callback
+    MaxRestarts      int              // Max restart attempts; -1 unlimited, 0 no restart (default: -1)
+    RestartBaseDelay time.Duration    // Restart backoff base delay (default: 1s)
+    RestartMaxDelay  time.Duration    // Restart backoff max delay (default: 30s)
 }
 ```
 
