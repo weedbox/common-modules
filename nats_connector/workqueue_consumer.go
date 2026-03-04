@@ -177,6 +177,8 @@ func (wqc *WorkQueueConsumer) startConsuming(handler MessageHandler) (jetstream.
 		select {
 		case semaphore <- struct{}{}:
 		case <-wqc.ctx.Done():
+			// Shutdown before we could process — nack for immediate redelivery
+			_ = msg.Nak()
 			return
 		}
 
@@ -226,6 +228,13 @@ func (wqc *WorkQueueConsumer) processMessage(msg jetstream.Msg, handler MessageH
 	for {
 		select {
 		case err := <-done:
+			// If context was cancelled during processing, always nack
+			// to ensure redelivery on restart, regardless of handler result.
+			if wqc.ctx.Err() != nil {
+				_ = msg.Nak()
+				return
+			}
+
 			if err != nil {
 				wqc.handleError(fmt.Errorf("message processing failed: %w", err))
 				// Processing failed, nack with backoff to requeue message
@@ -248,6 +257,8 @@ func (wqc *WorkQueueConsumer) processMessage(msg jetstream.Msg, handler MessageH
 			}
 
 		case <-wqc.ctx.Done():
+			// Shutdown while processing — nack for immediate redelivery on restart
+			_ = msg.Nak()
 			return
 		}
 	}
