@@ -166,6 +166,9 @@ func (c *NATSConnector) NewWorkQueueConsumer(streamName string, cfg WorkQueueCon
 	if cfg.MaxAckPending <= 0 {
 		cfg.MaxAckPending = DefaultMaxAckPending
 	}
+	if cfg.MaxRetries == 0 {
+		cfg.MaxRetries = DefaultMaxRetries
+	}
 
 	if cfg.MaxRestarts != 0 || cfg.RestartBaseDelay != 0 || cfg.RestartMaxDelay != 0 {
 		if cfg.RestartBaseDelay <= 0 {
