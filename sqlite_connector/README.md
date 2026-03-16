@@ -9,6 +9,7 @@ A SQLite database connector module built on [GORM](https://gorm.io/), integrated
 - Automatic directory creation for database file
 - GORM logger integration with debug mode support
 - Lightweight embedded database
+- Concurrent read/write support via WAL mode and connection pool
 
 ## Installation
 
@@ -177,6 +178,11 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 | `{scope}.path` | `./data.db` | Path to SQLite database file |
 | `{scope}.loglevel` | `4` (Error) | GORM log level (1=Silent, 2=Error, 3=Warn, 4=Info) |
 | `{scope}.debug_mode` | `false` | Enable debug mode with detailed SQL logging |
+| `{scope}.enable_wal` | `true` | Enable WAL (Write-Ahead Logging) journal mode for concurrent read/write |
+| `{scope}.busy_timeout` | `5000` | Milliseconds to wait when the database is locked before returning an error |
+| `{scope}.max_open_conns` | `10` | Maximum number of open connections in the pool |
+| `{scope}.max_idle_conns` | `5` | Maximum number of idle connections in the pool |
+| `{scope}.conn_max_lifetime` | `3600` | Maximum lifetime of a connection in seconds |
 
 ### TOML Configuration Example
 
@@ -185,6 +191,11 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 path = "./data/myapp.db"
 loglevel = 4
 debug_mode = false
+enable_wal = true
+busy_timeout = 5000
+max_open_conns = 10
+max_idle_conns = 5
+conn_max_lifetime = 3600
 ```
 
 ### Environment Variables Example
@@ -193,6 +204,11 @@ debug_mode = false
 export DATABASE_PATH=./data/myapp.db
 export DATABASE_LOGLEVEL=4
 export DATABASE_DEBUG_MODE=true
+export DATABASE_ENABLE_WAL=true
+export DATABASE_BUSY_TIMEOUT=5000
+export DATABASE_MAX_OPEN_CONNS=10
+export DATABASE_MAX_IDLE_CONNS=5
+export DATABASE_CONN_MAX_LIFETIME=3600
 ```
 
 ## API Reference
@@ -248,6 +264,18 @@ When `debug_mode` is enabled:
 
 This is useful for development and debugging database queries.
 
+## Concurrent Read/Write
+
+By default, the connector enables **WAL (Write-Ahead Logging)** mode and configures a connection pool to support concurrent access. WAL mode allows multiple readers to operate simultaneously without being blocked by a writer.
+
+Key behaviors:
+- **WAL mode** (`enable_wal`): Readers do not block writers and writers do not block readers. Only one writer can operate at a time; other writes will wait up to `busy_timeout` milliseconds.
+- **Busy timeout** (`busy_timeout`): When a connection encounters a database lock, it waits for the specified duration instead of immediately returning a `database is locked` error.
+- **Connection pool** (`max_open_conns`, `max_idle_conns`, `conn_max_lifetime`): Manages multiple connections to allow concurrent database operations.
+- **Foreign keys**: Automatically enabled via `_foreign_keys=on` PRAGMA.
+
+> **Note**: WAL mode is recommended for most use cases. Set `enable_wal` to `false` only if you need rollback journal mode for specific compatibility reasons.
+
 ## SQLite vs PostgreSQL
 
 Use SQLite when:
@@ -259,7 +287,6 @@ Use SQLite when:
 Use PostgreSQL when:
 - Building production web services
 - Need advanced features (JSON, full-text search, etc.)
-- Require concurrent write access
 - Need horizontal scaling
 
 ## License

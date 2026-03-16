@@ -18,9 +18,14 @@ import (
 )
 
 const (
-	DefaultPath      = "./data.db"
-	DefaultLogLevel  = gorm_logger.Error
-	DefaultDebugMode = false
+	DefaultPath            = "./data.db"
+	DefaultLogLevel        = gorm_logger.Error
+	DefaultDebugMode       = false
+	DefaultEnableWAL       = true
+	DefaultBusyTimeout     = 5000
+	DefaultMaxOpenConns    = 10
+	DefaultMaxIdleConns    = 5
+	DefaultConnMaxLifetime = 3600
 )
 
 type SQLiteConnector struct {
@@ -70,6 +75,24 @@ func (c *SQLiteConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("path"), DefaultPath)
 	viper.SetDefault(c.getConfigPath("loglevel"), DefaultLogLevel)
 	viper.SetDefault(c.getConfigPath("debug_mode"), DefaultDebugMode)
+	viper.SetDefault(c.getConfigPath("enable_wal"), DefaultEnableWAL)
+	viper.SetDefault(c.getConfigPath("busy_timeout"), DefaultBusyTimeout)
+	viper.SetDefault(c.getConfigPath("max_open_conns"), DefaultMaxOpenConns)
+	viper.SetDefault(c.getConfigPath("max_idle_conns"), DefaultMaxIdleConns)
+	viper.SetDefault(c.getConfigPath("conn_max_lifetime"), DefaultConnMaxLifetime)
+}
+
+func (c *SQLiteConnector) buildDSN(dbPath string) string {
+	enableWAL := viper.GetBool(c.getConfigPath("enable_wal"))
+	busyTimeout := viper.GetInt(c.getConfigPath("busy_timeout"))
+
+	dsn := fmt.Sprintf("file:%s?_busy_timeout=%d&_foreign_keys=on", dbPath, busyTimeout)
+
+	if enableWAL {
+		dsn += "&_journal_mode=WAL"
+	}
+
+	return dsn
 }
 
 func (c *SQLiteConnector) onStart(ctx context.Context) error {
@@ -85,9 +108,17 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 		}
 	}
 
+	enableWAL := viper.GetBool(c.getConfigPath("enable_wal"))
+	maxOpenConns := viper.GetInt(c.getConfigPath("max_open_conns"))
+	maxIdleConns := viper.GetInt(c.getConfigPath("max_idle_conns"))
+	connMaxLifetime := viper.GetInt(c.getConfigPath("conn_max_lifetime"))
+
 	c.logger.Info("Starting SQLiteConnector",
 		zap.String("path", dbPath),
 		zap.Int("loglevel", viper.GetInt(c.getConfigPath("loglevel"))),
+		zap.Bool("wal_mode", enableWAL),
+		zap.Int("max_open_conns", maxOpenConns),
+		zap.Int("max_idle_conns", maxIdleConns),
 	)
 
 	// Default logger configuration
@@ -117,10 +148,21 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 		TranslateError: true,
 	}
 
-	db, err := gorm.Open(sqlite.Open(dbPath), opts)
+	dsn := c.buildDSN(dbPath)
+	db, err := gorm.Open(sqlite.Open(dsn), opts)
 	if err != nil {
 		return err
 	}
+
+	// Configure connection pool for concurrent access
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
+	}
+
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxIdleConns)
+	sqlDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
 
 	c.db = db
 	return nil
