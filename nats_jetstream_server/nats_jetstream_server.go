@@ -17,6 +17,7 @@ import (
 )
 
 const (
+	DefaultEnabled             = true
 	DefaultHost                = "0.0.0.0"
 	DefaultPort                = 4222
 	DefaultHTTPPort            = 8222
@@ -84,6 +85,9 @@ func (s *NATSJetStreamServer) getConfigPath(key string) string {
 }
 
 func (s *NATSJetStreamServer) initDefaultConfigs() {
+	// Module enabled config
+	viper.SetDefault(s.getConfigPath("enabled"), DefaultEnabled)
+
 	// Server basic configs
 	viper.SetDefault(s.getConfigPath("host"), DefaultHost)
 	viper.SetDefault(s.getConfigPath("port"), DefaultPort)
@@ -250,6 +254,12 @@ func (s *NATSJetStreamServer) buildServerOptions() (*server.Options, error) {
 }
 
 func (s *NATSJetStreamServer) onStart(ctx context.Context) error {
+
+	if !viper.GetBool(s.getConfigPath("enabled")) {
+		s.logger.Info("NATS JetStream Server is disabled, skipping startup")
+		return nil
+	}
+
 	var err error
 
 	// Build server options
@@ -296,6 +306,10 @@ func (s *NATSJetStreamServer) onStart(ctx context.Context) error {
 }
 
 func (s *NATSJetStreamServer) onStop(ctx context.Context) error {
+	if !viper.GetBool(s.getConfigPath("enabled")) {
+		return nil
+	}
+
 	if s.server != nil {
 		logger.Info("Stopping NATS JetStream Server")
 

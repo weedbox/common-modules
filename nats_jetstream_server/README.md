@@ -99,6 +99,12 @@ func (s *Service) GetServerInfo() {
 
 Configuration is managed via Viper. All config keys are prefixed with the module's scope:
 
+### Module Configuration
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `{scope}.enabled` | `true` | Enable or disable the NATS JetStream server |
+
 ### Server Basic Configuration
 
 | Key | Default | Description |
@@ -151,6 +157,7 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 
 ```toml
 [nats_server]
+enabled = true
 host = "0.0.0.0"
 port = 4222
 http_port = 8222
@@ -184,6 +191,7 @@ ca_file = "/path/to/ca.crt"
 ### Environment Variables Example
 
 ```bash
+export NATS_SERVER_ENABLED=true
 export NATS_SERVER_HOST=0.0.0.0
 export NATS_SERVER_PORT=4222
 export NATS_SERVER_HTTP_PORT=8222
