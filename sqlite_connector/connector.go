@@ -106,14 +106,6 @@ func (c *SQLiteConnector) buildDSN(dbPath string) string {
 	return dsn
 }
 
-// buildReadOnlyDSN returns a DSN suitable for replica (read-only) connections.
-// We deliberately drop `_journal_mode=WAL` and `_foreign_keys=on` because RO
-// connections cannot mutate PRAGMAs and FK enforcement only applies to writes.
-func (c *SQLiteConnector) buildReadOnlyDSN(dbPath string) string {
-	busyTimeout := viper.GetInt(c.getConfigPath("busy_timeout"))
-	return fmt.Sprintf("file:%s?mode=ro&_busy_timeout=%d", dbPath, busyTimeout)
-}
-
 func (c *SQLiteConnector) onStart(ctx context.Context) error {
 	dbPath := viper.GetString(c.getConfigPath("path"))
 
@@ -193,10 +185,15 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 
 	// Read/write split: register replica via dbresolver first, applying the
 	// configured pool settings to both source and replicas, then override the
-	// primary (source) pool down to a single serialized writer.
-	readDSN := c.buildReadOnlyDSN(dbPath)
+	// primary (source) pool with the writer-specific settings.
+	//
+	// The replica DSN intentionally matches the primary DSN (no mode=ro). With
+	// mode=ro the connection cannot create or write the *-shm file or register
+	// itself in the WAL read marks, so it would fail to see frames written by
+	// the primary. WAL is also passed explicitly so the first connection (which
+	// might be the replica on a fresh DB) sets the journal mode.
 	resolver := dbresolver.Register(dbresolver.Config{
-		Replicas: []gorm.Dialector{sqlite.Open(readDSN)},
+		Replicas: []gorm.Dialector{sqlite.Open(dsn)},
 		Policy:   dbresolver.RandomPolicy{},
 	}).
 		SetMaxOpenConns(maxOpenConns).
@@ -210,14 +207,12 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 
 	c.resolver = resolver
 
-	// Override the primary pool. SQLite writes are serialized at the storage
-	// engine, so this pool defaults to 1 but is configurable.
+	// Override the primary pool with writer-specific settings.
 	primaryDB.SetMaxOpenConns(writeMaxOpenConns)
 	primaryDB.SetMaxIdleConns(writeMaxIdleConns)
 	primaryDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
 
 	c.logger.Info("Read/write split enabled",
-		zap.String("read_dsn", readDSN),
 		zap.Int("primary_max_open_conns", writeMaxOpenConns),
 		zap.Int("primary_max_idle_conns", writeMaxIdleConns),
 		zap.Int("replica_max_open_conns", maxOpenConns),

@@ -290,10 +290,12 @@ Key behaviors:
 
 Read/write splitting is enabled by default (`enable_read_write_split=true`). The connector wires a single `*gorm.DB` to two separate `*sql.DB` pools using GORM's official [`dbresolver`](https://gorm.io/docs/dbresolver.html) plugin:
 
-- **Primary (write)** — uses the original DSN. Pool size is controlled by `write_max_open_conns` / `write_max_idle_conns` (defaults `10` / `5`). Lower these (e.g. to `1` / `1`) to serialize writes at the Go layer if you are seeing `SQLITE_BUSY` errors under contention.
-- **Replicas (read)** — opens the same database file with `mode=ro` appended to the URI. Pool size follows the configured `max_open_conns` / `max_idle_conns`, allowing many concurrent readers.
+- **Primary (write)** — pool size is controlled by `write_max_open_conns` / `write_max_idle_conns` (defaults `10` / `5`). Lower these (e.g. to `1` / `1`) to serialize writes at the Go layer if you are seeing `SQLITE_BUSY` errors under contention.
+- **Replicas (read)** — pool size follows the configured `max_open_conns` / `max_idle_conns`, allowing many concurrent readers.
 
-GORM routes `SELECT` to the replica pool and all mutations to the primary, so application code does not need to change. Set `enable_read_write_split` to `false` to keep the legacy single-pool behavior.
+Both pools open the database with the same DSN (including `_journal_mode=WAL`). Routing is handled at the SQL operation layer by `dbresolver`: `SELECT` / `First` / `Find` / `Count` / `Pluck` / `Take` / `Scan` go to the replica pool, while `Create` / `Save` / `Update` / `Delete` / `Transaction` / `Raw` / `Exec` go to the primary. Application code does not need to change. Set `enable_read_write_split` to `false` to fall back to the legacy single-pool behavior.
+
+> **Why no `mode=ro` on the replica DSN**: a `mode=ro` connection cannot create or write the `-shm` file, register read marks in the WAL, or otherwise participate in the WAL protocol — so it would silently miss frames produced by the primary. Routing safety comes from `dbresolver` at the SQL layer, not from the file open mode.
 
 > **Note**: Read/write splitting only makes sense when `enable_wal` is `true`. WAL is what allows readers and writers to operate concurrently against the same SQLite file.
 
