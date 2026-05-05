@@ -30,10 +30,11 @@ const (
 	DefaultConnMaxLifetime      = 3600
 	DefaultEnableReadWriteSplit = true
 
-	// When read/write split is enabled, the primary (write) pool is forced
-	// to a single connection so SQLite writes are serialized at the Go layer.
-	primaryWriteMaxOpenConns = 1
-	primaryWriteMaxIdleConns = 1
+	// SQLite writes are serialized at the storage engine, so the primary
+	// (write) pool defaults to a single connection. Override via
+	// `{scope}.write_max_open_conns` / `{scope}.write_max_idle_conns`.
+	DefaultWriteMaxOpenConns = 1
+	DefaultWriteMaxIdleConns = 1
 )
 
 type SQLiteConnector struct {
@@ -91,6 +92,8 @@ func (c *SQLiteConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("max_idle_conns"), DefaultMaxIdleConns)
 	viper.SetDefault(c.getConfigPath("conn_max_lifetime"), DefaultConnMaxLifetime)
 	viper.SetDefault(c.getConfigPath("enable_read_write_split"), DefaultEnableReadWriteSplit)
+	viper.SetDefault(c.getConfigPath("write_max_open_conns"), DefaultWriteMaxOpenConns)
+	viper.SetDefault(c.getConfigPath("write_max_idle_conns"), DefaultWriteMaxIdleConns)
 }
 
 func (c *SQLiteConnector) buildDSN(dbPath string) string {
@@ -132,6 +135,8 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 	maxIdleConns := viper.GetInt(c.getConfigPath("max_idle_conns"))
 	connMaxLifetime := viper.GetInt(c.getConfigPath("conn_max_lifetime"))
 	enableSplit := viper.GetBool(c.getConfigPath("enable_read_write_split"))
+	writeMaxOpenConns := viper.GetInt(c.getConfigPath("write_max_open_conns"))
+	writeMaxIdleConns := viper.GetInt(c.getConfigPath("write_max_idle_conns"))
 
 	c.logger.Info("Starting SQLiteConnector",
 		zap.String("path", dbPath),
@@ -208,14 +213,16 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 
 	c.resolver = resolver
 
-	// Override the primary pool: SQLite writes must be serialized.
-	primaryDB.SetMaxOpenConns(primaryWriteMaxOpenConns)
-	primaryDB.SetMaxIdleConns(primaryWriteMaxIdleConns)
+	// Override the primary pool. SQLite writes are serialized at the storage
+	// engine, so this pool defaults to 1 but is configurable.
+	primaryDB.SetMaxOpenConns(writeMaxOpenConns)
+	primaryDB.SetMaxIdleConns(writeMaxIdleConns)
 	primaryDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
 
 	c.logger.Info("Read/write split enabled",
 		zap.String("read_dsn", readDSN),
-		zap.Int("primary_max_open_conns", primaryWriteMaxOpenConns),
+		zap.Int("primary_max_open_conns", writeMaxOpenConns),
+		zap.Int("primary_max_idle_conns", writeMaxIdleConns),
 		zap.Int("replica_max_open_conns", maxOpenConns),
 	)
 
