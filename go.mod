@@ -18,6 +18,7 @@ require (
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/driver/sqlite v1.6.0
 	gorm.io/gorm v1.31.0
+	gorm.io/plugin/dbresolver v1.6.2
 )
 
 replace github.com/Weedbox/scheduler => ../scheduler

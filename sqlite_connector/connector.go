@@ -2,6 +2,7 @@ package sqlite_connector
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -15,24 +16,33 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	gorm_logger "gorm.io/gorm/logger"
+	"gorm.io/plugin/dbresolver"
 )
 
 const (
-	DefaultPath            = "./data.db"
-	DefaultLogLevel        = gorm_logger.Error
-	DefaultDebugMode       = false
-	DefaultEnableWAL       = true
-	DefaultBusyTimeout     = 5000
-	DefaultMaxOpenConns    = 10
-	DefaultMaxIdleConns    = 5
-	DefaultConnMaxLifetime = 3600
+	DefaultPath                 = "./data.db"
+	DefaultLogLevel             = gorm_logger.Error
+	DefaultDebugMode            = false
+	DefaultEnableWAL            = true
+	DefaultBusyTimeout          = 5000
+	DefaultMaxOpenConns         = 10
+	DefaultMaxIdleConns         = 5
+	DefaultConnMaxLifetime      = 3600
+	DefaultEnableReadWriteSplit = true
+
+	// When read/write split is enabled, the primary (write) pool is forced
+	// to a single connection so SQLite writes are serialized at the Go layer.
+	primaryWriteMaxOpenConns = 1
+	primaryWriteMaxIdleConns = 1
 )
 
 type SQLiteConnector struct {
-	params Params
-	logger *zap.Logger
-	db     *gorm.DB
-	scope  string
+	params     Params
+	logger     *zap.Logger
+	db         *gorm.DB
+	scope      string
+	resolver   *dbresolver.DBResolver
+	splitMode  bool
 }
 
 type Params struct {
@@ -80,6 +90,7 @@ func (c *SQLiteConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("max_open_conns"), DefaultMaxOpenConns)
 	viper.SetDefault(c.getConfigPath("max_idle_conns"), DefaultMaxIdleConns)
 	viper.SetDefault(c.getConfigPath("conn_max_lifetime"), DefaultConnMaxLifetime)
+	viper.SetDefault(c.getConfigPath("enable_read_write_split"), DefaultEnableReadWriteSplit)
 }
 
 func (c *SQLiteConnector) buildDSN(dbPath string) string {
@@ -93,6 +104,14 @@ func (c *SQLiteConnector) buildDSN(dbPath string) string {
 	}
 
 	return dsn
+}
+
+// buildReadOnlyDSN returns a DSN suitable for replica (read-only) connections.
+// We deliberately drop `_journal_mode=WAL` and `_foreign_keys=on` because RO
+// connections cannot mutate PRAGMAs and FK enforcement only applies to writes.
+func (c *SQLiteConnector) buildReadOnlyDSN(dbPath string) string {
+	busyTimeout := viper.GetInt(c.getConfigPath("busy_timeout"))
+	return fmt.Sprintf("file:%s?mode=ro&_busy_timeout=%d", dbPath, busyTimeout)
 }
 
 func (c *SQLiteConnector) onStart(ctx context.Context) error {
@@ -112,6 +131,7 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 	maxOpenConns := viper.GetInt(c.getConfigPath("max_open_conns"))
 	maxIdleConns := viper.GetInt(c.getConfigPath("max_idle_conns"))
 	connMaxLifetime := viper.GetInt(c.getConfigPath("conn_max_lifetime"))
+	enableSplit := viper.GetBool(c.getConfigPath("enable_read_write_split"))
 
 	c.logger.Info("Starting SQLiteConnector",
 		zap.String("path", dbPath),
@@ -119,6 +139,7 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 		zap.Bool("wal_mode", enableWAL),
 		zap.Int("max_open_conns", maxOpenConns),
 		zap.Int("max_idle_conns", maxIdleConns),
+		zap.Bool("read_write_split", enableSplit),
 	)
 
 	// Default logger configuration
@@ -137,9 +158,8 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 		loggerCfg.IgnoreRecordNotFoundError = false // Show RecordNotFound in debug mode
 	}
 
-	// Create logger based on Default config but with IgnoreRecordNotFoundError enabled
 	gormLogger := gorm_logger.New(
-		log.New(os.Stdout, "\r\n", log.LstdFlags), // Same as Default
+		log.New(os.Stdout, "\r\n", log.LstdFlags),
 		loggerCfg,
 	)
 
@@ -154,22 +174,69 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 		return err
 	}
 
-	// Configure connection pool for concurrent access
-	sqlDB, err := db.DB()
+	primaryDB, err := db.DB()
 	if err != nil {
 		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
 	}
 
-	sqlDB.SetMaxOpenConns(maxOpenConns)
-	sqlDB.SetMaxIdleConns(maxIdleConns)
-	sqlDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
-
+	c.splitMode = enableSplit
 	c.db = db
+
+	if !enableSplit {
+		primaryDB.SetMaxOpenConns(maxOpenConns)
+		primaryDB.SetMaxIdleConns(maxIdleConns)
+		primaryDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
+		return nil
+	}
+
+	// Read/write split: register replica via dbresolver first, applying the
+	// configured pool settings to both source and replicas, then override the
+	// primary (source) pool down to a single serialized writer.
+	readDSN := c.buildReadOnlyDSN(dbPath)
+	resolver := dbresolver.Register(dbresolver.Config{
+		Replicas: []gorm.Dialector{sqlite.Open(readDSN)},
+		Policy:   dbresolver.RandomPolicy{},
+	}).
+		SetMaxOpenConns(maxOpenConns).
+		SetMaxIdleConns(maxIdleConns).
+		SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
+
+	if err := db.Use(resolver); err != nil {
+		_ = primaryDB.Close()
+		return fmt.Errorf("failed to register dbresolver: %w", err)
+	}
+
+	c.resolver = resolver
+
+	// Override the primary pool: SQLite writes must be serialized.
+	primaryDB.SetMaxOpenConns(primaryWriteMaxOpenConns)
+	primaryDB.SetMaxIdleConns(primaryWriteMaxIdleConns)
+	primaryDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
+
+	c.logger.Info("Read/write split enabled",
+		zap.String("read_dsn", readDSN),
+		zap.Int("primary_max_open_conns", primaryWriteMaxOpenConns),
+		zap.Int("replica_max_open_conns", maxOpenConns),
+	)
+
 	return nil
 }
 
 func (c *SQLiteConnector) onStop(ctx context.Context) error {
 	c.logger.Info("Stopped SQLiteConnector")
+
+	if c.resolver != nil {
+		// Close every connPool registered with the resolver. The resolver
+		// iterates sources (primary) and replicas, so this also closes the
+		// primary's underlying sql.DB.
+		return c.resolver.Call(func(cp gorm.ConnPool) error {
+			if closer, ok := cp.(*sql.DB); ok {
+				return closer.Close()
+			}
+			return nil
+		})
+	}
+
 	db, err := c.db.DB()
 	if err != nil {
 		return err

@@ -10,6 +10,7 @@ A SQLite database connector module built on [GORM](https://gorm.io/), integrated
 - GORM logger integration with debug mode support
 - Lightweight embedded database
 - Concurrent read/write support via WAL mode and connection pool
+- Optional read/write splitting via [`gorm.io/plugin/dbresolver`](https://gorm.io/docs/dbresolver.html)
 
 ## Installation
 
@@ -180,9 +181,10 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 | `{scope}.debug_mode` | `false` | Enable debug mode with detailed SQL logging |
 | `{scope}.enable_wal` | `true` | Enable WAL (Write-Ahead Logging) journal mode for concurrent read/write |
 | `{scope}.busy_timeout` | `5000` | Milliseconds to wait when the database is locked before returning an error |
-| `{scope}.max_open_conns` | `10` | Maximum number of open connections in the pool |
-| `{scope}.max_idle_conns` | `5` | Maximum number of idle connections in the pool |
+| `{scope}.max_open_conns` | `10` | Maximum number of open connections in the pool. When `enable_read_write_split` is `true`, this applies to the read replica pool only; the primary (write) pool is forced to `1`. |
+| `{scope}.max_idle_conns` | `5` | Maximum number of idle connections in the pool. When `enable_read_write_split` is `true`, this applies to the read replica pool only; the primary (write) pool is forced to `1`. |
 | `{scope}.conn_max_lifetime` | `3600` | Maximum lifetime of a connection in seconds |
+| `{scope}.enable_read_write_split` | `true` | Enable read/write splitting via dbresolver. Writes go to the primary connection (forced `max_open_conns=1` to serialize writes); reads go to a separate pool opened with `mode=ro`. Set to `false` to fall back to the legacy single-pool behavior. |
 
 ### TOML Configuration Example
 
@@ -196,6 +198,7 @@ busy_timeout = 5000
 max_open_conns = 10
 max_idle_conns = 5
 conn_max_lifetime = 3600
+enable_read_write_split = true
 ```
 
 ### Environment Variables Example
@@ -209,6 +212,7 @@ export DATABASE_BUSY_TIMEOUT=5000
 export DATABASE_MAX_OPEN_CONNS=10
 export DATABASE_MAX_IDLE_CONNS=5
 export DATABASE_CONN_MAX_LIFETIME=3600
+export DATABASE_ENABLE_READ_WRITE_SPLIT=true
 ```
 
 ## API Reference
@@ -275,6 +279,17 @@ Key behaviors:
 - **Foreign keys**: Automatically enabled via `_foreign_keys=on` PRAGMA.
 
 > **Note**: WAL mode is recommended for most use cases. Set `enable_wal` to `false` only if you need rollback journal mode for specific compatibility reasons.
+
+## Read/Write Splitting
+
+Read/write splitting is enabled by default (`enable_read_write_split=true`). The connector wires a single `*gorm.DB` to two separate `*sql.DB` pools using GORM's official [`dbresolver`](https://gorm.io/docs/dbresolver.html) plugin:
+
+- **Primary (write)** — uses the original DSN. Pool is forced to `max_open_conns=1` and `max_idle_conns=1` so all writes are serialized at the Go layer, eliminating one source of `SQLITE_BUSY` errors.
+- **Replicas (read)** — opens the same database file with `mode=ro` appended to the URI. Pool size follows the configured `max_open_conns` / `max_idle_conns`, allowing many concurrent readers.
+
+GORM routes `SELECT` to the replica pool and all mutations to the primary, so application code does not need to change. Set `enable_read_write_split` to `false` to keep the legacy single-pool behavior.
+
+> **Note**: Read/write splitting only makes sense when `enable_wal` is `true`. WAL is what allows readers and writers to operate concurrently against the same SQLite file.
 
 ## SQLite vs PostgreSQL
 
