@@ -30,11 +30,8 @@ const (
 	DefaultConnMaxLifetime      = 3600
 	DefaultEnableReadWriteSplit = true
 
-	// SQLite writes are serialized at the storage engine, so the primary
-	// (write) pool defaults to a single connection. Override via
-	// `{scope}.write_max_open_conns` / `{scope}.write_max_idle_conns`.
-	DefaultWriteMaxOpenConns = 1
-	DefaultWriteMaxIdleConns = 1
+	DefaultWriteMaxOpenConns = 10
+	DefaultWriteMaxIdleConns = 5
 )
 
 type SQLiteConnector struct {

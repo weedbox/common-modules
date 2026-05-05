@@ -185,8 +185,8 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 | `{scope}.max_idle_conns` | `5` | Maximum number of idle connections in the pool. When `enable_read_write_split` is `true`, this applies to the read replica pool only; the primary (write) pool is forced to `1`. |
 | `{scope}.conn_max_lifetime` | `3600` | Maximum lifetime of a connection in seconds |
 | `{scope}.enable_read_write_split` | `true` | Enable read/write splitting via dbresolver. Writes go to the primary connection; reads go to a separate pool opened with `mode=ro`. Set to `false` to fall back to the legacy single-pool behavior. |
-| `{scope}.write_max_open_conns` | `1` | Maximum open connections in the primary (write) pool when read/write split is enabled. Defaults to `1` because SQLite serializes writes at the storage engine. |
-| `{scope}.write_max_idle_conns` | `1` | Maximum idle connections in the primary (write) pool when read/write split is enabled. |
+| `{scope}.write_max_open_conns` | `10` | Maximum open connections in the primary (write) pool when read/write split is enabled. |
+| `{scope}.write_max_idle_conns` | `5` | Maximum idle connections in the primary (write) pool when read/write split is enabled. |
 
 ### TOML Configuration Example
 
@@ -201,8 +201,8 @@ max_open_conns = 10
 max_idle_conns = 5
 conn_max_lifetime = 3600
 enable_read_write_split = true
-write_max_open_conns = 1
-write_max_idle_conns = 1
+write_max_open_conns = 10
+write_max_idle_conns = 5
 ```
 
 ### Environment Variables Example
@@ -217,8 +217,8 @@ export DATABASE_MAX_OPEN_CONNS=10
 export DATABASE_MAX_IDLE_CONNS=5
 export DATABASE_CONN_MAX_LIFETIME=3600
 export DATABASE_ENABLE_READ_WRITE_SPLIT=true
-export DATABASE_WRITE_MAX_OPEN_CONNS=1
-export DATABASE_WRITE_MAX_IDLE_CONNS=1
+export DATABASE_WRITE_MAX_OPEN_CONNS=10
+export DATABASE_WRITE_MAX_IDLE_CONNS=5
 ```
 
 ## API Reference
@@ -290,7 +290,7 @@ Key behaviors:
 
 Read/write splitting is enabled by default (`enable_read_write_split=true`). The connector wires a single `*gorm.DB` to two separate `*sql.DB` pools using GORM's official [`dbresolver`](https://gorm.io/docs/dbresolver.html) plugin:
 
-- **Primary (write)** — uses the original DSN. Pool defaults to `write_max_open_conns=1` / `write_max_idle_conns=1` so writes are serialized at the Go layer, eliminating one source of `SQLITE_BUSY` errors. Override via `write_max_open_conns` / `write_max_idle_conns` if your workload needs a larger writer pool.
+- **Primary (write)** — uses the original DSN. Pool size is controlled by `write_max_open_conns` / `write_max_idle_conns` (defaults `10` / `5`). Lower these (e.g. to `1` / `1`) to serialize writes at the Go layer if you are seeing `SQLITE_BUSY` errors under contention.
 - **Replicas (read)** — opens the same database file with `mode=ro` appended to the URI. Pool size follows the configured `max_open_conns` / `max_idle_conns`, allowing many concurrent readers.
 
 GORM routes `SELECT` to the replica pool and all mutations to the primary, so application code does not need to change. Set `enable_read_write_split` to `false` to keep the legacy single-pool behavior.
