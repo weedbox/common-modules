@@ -181,10 +181,11 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 | `{scope}.debug_mode` | `false` | Enable debug mode with detailed SQL logging |
 | `{scope}.enable_wal` | `true` | Enable WAL (Write-Ahead Logging) journal mode for concurrent read/write |
 | `{scope}.busy_timeout` | `5000` | Milliseconds to wait when the database is locked before returning an error |
-| `{scope}.max_open_conns` | `10` | Maximum number of open connections in the pool. When `enable_read_write_split` is `true`, this applies to the read replica pool only; the primary (write) pool is forced to `1`. |
-| `{scope}.max_idle_conns` | `5` | Maximum number of idle connections in the pool. When `enable_read_write_split` is `true`, this applies to the read replica pool only; the primary (write) pool is forced to `1`. |
+| `{scope}.max_open_conns` | `10` | Maximum number of open connections in the pool. When `enable_read_write_split` is `true`, this applies to the read replica pool only; the primary (write) pool uses `write_max_open_conns`. |
+| `{scope}.max_idle_conns` | `1` | Maximum number of idle connections in the pool. When `enable_read_write_split` is `true`, this applies to the read replica pool only; the primary (write) pool uses `write_max_idle_conns`. Kept low so idle reader connections do not pin WAL frames and block checkpointing. |
 | `{scope}.conn_max_lifetime` | `3600` | Maximum lifetime of a connection in seconds |
-| `{scope}.enable_read_write_split` | `true` | Enable read/write splitting via dbresolver. Writes go to the primary connection; reads go to a separate pool opened with `mode=ro`. Set to `false` to fall back to the legacy single-pool behavior. |
+| `{scope}.conn_max_idle_time` | `30` | Seconds an idle connection can stay in the pool before being closed. Important for SQLite + WAL: an idle connection holds the snapshot of its last `SELECT`, preventing `wal_checkpoint` from advancing past it. Closing idle connections promptly releases that snapshot. |
+| `{scope}.enable_read_write_split` | `true` | Enable read/write splitting via dbresolver. Writes go to the primary connection; reads go to a separate pool. Set to `false` to fall back to the legacy single-pool behavior. |
 | `{scope}.write_max_open_conns` | `10` | Maximum open connections in the primary (write) pool when read/write split is enabled. |
 | `{scope}.write_max_idle_conns` | `1` | Maximum idle connections in the primary (write) pool when read/write split is enabled. Defaults to `1` because SQLite serializes writes — keeping many idle writer connections holding the file gains nothing. |
 
@@ -198,8 +199,9 @@ debug_mode = false
 enable_wal = true
 busy_timeout = 5000
 max_open_conns = 10
-max_idle_conns = 5
+max_idle_conns = 1
 conn_max_lifetime = 3600
+conn_max_idle_time = 30
 enable_read_write_split = true
 write_max_open_conns = 10
 write_max_idle_conns = 1
@@ -214,8 +216,9 @@ export DATABASE_DEBUG_MODE=true
 export DATABASE_ENABLE_WAL=true
 export DATABASE_BUSY_TIMEOUT=5000
 export DATABASE_MAX_OPEN_CONNS=10
-export DATABASE_MAX_IDLE_CONNS=5
+export DATABASE_MAX_IDLE_CONNS=1
 export DATABASE_CONN_MAX_LIFETIME=3600
+export DATABASE_CONN_MAX_IDLE_TIME=30
 export DATABASE_ENABLE_READ_WRITE_SPLIT=true
 export DATABASE_WRITE_MAX_OPEN_CONNS=10
 export DATABASE_WRITE_MAX_IDLE_CONNS=1
@@ -281,7 +284,7 @@ By default, the connector enables **WAL (Write-Ahead Logging)** mode and configu
 Key behaviors:
 - **WAL mode** (`enable_wal`): Readers do not block writers and writers do not block readers. Only one writer can operate at a time; other writes will wait up to `busy_timeout` milliseconds.
 - **Busy timeout** (`busy_timeout`): When a connection encounters a database lock, it waits for the specified duration instead of immediately returning a `database is locked` error.
-- **Connection pool** (`max_open_conns`, `max_idle_conns`, `conn_max_lifetime`): Manages multiple connections to allow concurrent database operations.
+- **Connection pool** (`max_open_conns`, `max_idle_conns`, `conn_max_lifetime`, `conn_max_idle_time`): Manages multiple connections to allow concurrent database operations. `conn_max_idle_time` is particularly important under WAL: an idle connection holds the read snapshot of its last query and prevents `wal_checkpoint` from advancing past it. Closing idle connections promptly lets WAL frames recycle into the main file.
 - **Foreign keys**: Automatically enabled via `_foreign_keys=on` PRAGMA.
 
 > **Note**: WAL mode is recommended for most use cases. Set `enable_wal` to `false` only if you need rollback journal mode for specific compatibility reasons.

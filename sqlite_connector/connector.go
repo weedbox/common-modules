@@ -26,8 +26,9 @@ const (
 	DefaultEnableWAL            = true
 	DefaultBusyTimeout          = 5000
 	DefaultMaxOpenConns         = 10
-	DefaultMaxIdleConns         = 5
+	DefaultMaxIdleConns         = 1
 	DefaultConnMaxLifetime      = 3600
+	DefaultConnMaxIdleTime      = 30
 	DefaultEnableReadWriteSplit = true
 
 	DefaultWriteMaxOpenConns = 10
@@ -88,6 +89,7 @@ func (c *SQLiteConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("max_open_conns"), DefaultMaxOpenConns)
 	viper.SetDefault(c.getConfigPath("max_idle_conns"), DefaultMaxIdleConns)
 	viper.SetDefault(c.getConfigPath("conn_max_lifetime"), DefaultConnMaxLifetime)
+	viper.SetDefault(c.getConfigPath("conn_max_idle_time"), DefaultConnMaxIdleTime)
 	viper.SetDefault(c.getConfigPath("enable_read_write_split"), DefaultEnableReadWriteSplit)
 	viper.SetDefault(c.getConfigPath("write_max_open_conns"), DefaultWriteMaxOpenConns)
 	viper.SetDefault(c.getConfigPath("write_max_idle_conns"), DefaultWriteMaxIdleConns)
@@ -123,6 +125,7 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 	maxOpenConns := viper.GetInt(c.getConfigPath("max_open_conns"))
 	maxIdleConns := viper.GetInt(c.getConfigPath("max_idle_conns"))
 	connMaxLifetime := viper.GetInt(c.getConfigPath("conn_max_lifetime"))
+	connMaxIdleTime := viper.GetInt(c.getConfigPath("conn_max_idle_time"))
 	enableSplit := viper.GetBool(c.getConfigPath("enable_read_write_split"))
 	writeMaxOpenConns := viper.GetInt(c.getConfigPath("write_max_open_conns"))
 	writeMaxIdleConns := viper.GetInt(c.getConfigPath("write_max_idle_conns"))
@@ -133,6 +136,7 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 		zap.Bool("wal_mode", enableWAL),
 		zap.Int("max_open_conns", maxOpenConns),
 		zap.Int("max_idle_conns", maxIdleConns),
+		zap.Int("conn_max_idle_time", connMaxIdleTime),
 		zap.Bool("read_write_split", enableSplit),
 	)
 
@@ -180,6 +184,7 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 		primaryDB.SetMaxOpenConns(maxOpenConns)
 		primaryDB.SetMaxIdleConns(maxIdleConns)
 		primaryDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
+		primaryDB.SetConnMaxIdleTime(time.Duration(connMaxIdleTime) * time.Second)
 		return nil
 	}
 
@@ -198,7 +203,8 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 	}).
 		SetMaxOpenConns(maxOpenConns).
 		SetMaxIdleConns(maxIdleConns).
-		SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
+		SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second).
+		SetConnMaxIdleTime(time.Duration(connMaxIdleTime) * time.Second)
 
 	if err := db.Use(resolver); err != nil {
 		_ = primaryDB.Close()
@@ -207,10 +213,14 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 
 	c.resolver = resolver
 
-	// Override the primary pool with writer-specific settings.
+	// Override the primary pool with writer-specific settings. ConnMaxIdleTime
+	// was already applied to both source and replicas via the dbresolver chain
+	// above; it is reapplied here for symmetry so this block fully describes
+	// the primary pool and won't silently regress if the chain order changes.
 	primaryDB.SetMaxOpenConns(writeMaxOpenConns)
 	primaryDB.SetMaxIdleConns(writeMaxIdleConns)
 	primaryDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
+	primaryDB.SetConnMaxIdleTime(time.Duration(connMaxIdleTime) * time.Second)
 
 	c.logger.Info("Read/write split enabled",
 		zap.Int("primary_max_open_conns", writeMaxOpenConns),
