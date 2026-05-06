@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
@@ -33,6 +34,10 @@ const (
 
 	DefaultWriteMaxOpenConns = 10
 	DefaultWriteMaxIdleConns = 1
+
+	DefaultSynchronous = ""
+	DefaultCacheSize   = 0
+	DefaultLockingMode = ""
 )
 
 type SQLiteConnector struct {
@@ -93,16 +98,34 @@ func (c *SQLiteConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("enable_read_write_split"), DefaultEnableReadWriteSplit)
 	viper.SetDefault(c.getConfigPath("write_max_open_conns"), DefaultWriteMaxOpenConns)
 	viper.SetDefault(c.getConfigPath("write_max_idle_conns"), DefaultWriteMaxIdleConns)
+	viper.SetDefault(c.getConfigPath("synchronous"), DefaultSynchronous)
+	viper.SetDefault(c.getConfigPath("cache_size"), DefaultCacheSize)
+	viper.SetDefault(c.getConfigPath("locking_mode"), DefaultLockingMode)
 }
 
 func (c *SQLiteConnector) buildDSN(dbPath string) string {
 	enableWAL := viper.GetBool(c.getConfigPath("enable_wal"))
 	busyTimeout := viper.GetInt(c.getConfigPath("busy_timeout"))
+	synchronous := viper.GetString(c.getConfigPath("synchronous"))
+	cacheSize := viper.GetInt(c.getConfigPath("cache_size"))
+	lockingMode := viper.GetString(c.getConfigPath("locking_mode"))
 
 	dsn := fmt.Sprintf("file:%s?_busy_timeout=%d&_foreign_keys=on", dbPath, busyTimeout)
 
 	if enableWAL {
 		dsn += "&_journal_mode=WAL"
+	}
+
+	if synchronous != "" {
+		dsn += "&_synchronous=" + synchronous
+	}
+
+	if cacheSize != 0 {
+		dsn += fmt.Sprintf("&_cache_size=%d", cacheSize)
+	}
+
+	if lockingMode != "" {
+		dsn += "&_locking_mode=" + lockingMode
 	}
 
 	return dsn
@@ -129,6 +152,21 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 	enableSplit := viper.GetBool(c.getConfigPath("enable_read_write_split"))
 	writeMaxOpenConns := viper.GetInt(c.getConfigPath("write_max_open_conns"))
 	writeMaxIdleConns := viper.GetInt(c.getConfigPath("write_max_idle_conns"))
+	synchronous := viper.GetString(c.getConfigPath("synchronous"))
+	cacheSize := viper.GetInt(c.getConfigPath("cache_size"))
+	lockingMode := viper.GetString(c.getConfigPath("locking_mode"))
+
+	if strings.EqualFold(lockingMode, "EXCLUSIVE") {
+		if enableSplit {
+			c.logger.Warn("locking_mode=EXCLUSIVE is incompatible with read/write split; the second pool will fail to acquire the database lock — set enable_read_write_split=false")
+		}
+		if maxOpenConns > 1 || writeMaxOpenConns > 1 {
+			c.logger.Warn("locking_mode=EXCLUSIVE only works with a single connection; set max_open_conns=1 and write_max_open_conns=1 to avoid SQLITE_BUSY",
+				zap.Int("max_open_conns", maxOpenConns),
+				zap.Int("write_max_open_conns", writeMaxOpenConns),
+			)
+		}
+	}
 
 	c.logger.Info("Starting SQLiteConnector",
 		zap.String("path", dbPath),
@@ -138,6 +176,9 @@ func (c *SQLiteConnector) onStart(ctx context.Context) error {
 		zap.Int("max_idle_conns", maxIdleConns),
 		zap.Int("conn_max_idle_time", connMaxIdleTime),
 		zap.Bool("read_write_split", enableSplit),
+		zap.String("synchronous", synchronous),
+		zap.Int("cache_size", cacheSize),
+		zap.String("locking_mode", lockingMode),
 	)
 
 	// Default logger configuration
