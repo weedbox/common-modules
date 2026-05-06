@@ -31,7 +31,7 @@ const (
 	DefaultEnableReadWriteSplit = true
 
 	DefaultWriteMaxOpenConns = 10
-	DefaultWriteMaxIdleConns = 5
+	DefaultWriteMaxIdleConns = 1
 )
 
 type SQLiteConnector struct {
