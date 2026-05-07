@@ -8,6 +8,7 @@ A NATS messaging connector module built on [NATS Go Client](https://github.com/n
 - NATS core messaging support
 - JetStream support for persistent messaging
 - Work queue consumer with concurrency control
+- Batch message processing for bulk-friendly handlers
 - Automatic panic recovery and consumer restart with exponential backoff
 - Authentication support (credentials, NKey)
 - TLS support
@@ -171,6 +172,53 @@ func (w *Worker) StartConsumerWithRestart() error {
 }
 ```
 
+### Batch Message Processing
+
+When a handler can process many messages more efficiently together — bulk DB inserts, bulk HTTP forwarding, batched analytics — use the `StartBatch*` family. The consumer pulls up to `BatchSize` messages per iteration (waiting up to `BatchMaxWait` for the batch to fill) and invokes the handler once per batch.
+
+```go
+func (w *Worker) StartBatchConsumer() error {
+    config := nats_connector.NewWorkQueueConsumerConfig()
+    config.ConsumerName = "my-bulk-worker"
+    config.Subjects = []string{"events.>"}
+    config.MaxConcurrent = 4                // up to 4 batches in flight at once
+    config.BatchSize = 200                  // up to 200 messages per batch
+    config.BatchMaxWait = 500 * time.Millisecond
+    config.AckWait = 60 * time.Second       // give the bulk handler time to finish
+    config.MaxAckPending = 1000             // must be ≥ MaxConcurrent * BatchSize
+    config.OnError = func(err error) { log.Printf("Error: %v", err) }
+
+    consumer, err := w.params.NATS.NewWorkQueueConsumer("events-stream", config)
+    if err != nil {
+        return err
+    }
+
+    // Start batch consumer (blocking).
+    return consumer.StartBatch(func(ctx context.Context, msgs []jetstream.Msg) error {
+        rows := make([]Row, 0, len(msgs))
+        for _, m := range msgs {
+            rows = append(rows, parse(m.Data()))
+        }
+        // One round-trip for the whole batch.
+        if err := w.db.BulkInsert(ctx, rows); err != nil {
+            return err  // entire batch is nacked with backoff and redelivered
+        }
+        return nil  // entire batch is acked
+    })
+}
+```
+
+**Semantics:**
+
+- **All-or-nothing acknowledgement** — handler returns `nil` → every message in the batch is acked; handler returns an `error` (or panics) → every message is `NakWithDelay`'d using the same exponential backoff as the single-message path.
+- **Do not call `msg.Ack()` / `msg.Nak()` / `msg.InProgress()` inside the batch handler.** The consumer manages acknowledgement collectively. If you need per-message control, use the single-message `Start()` API instead — its `MaxConcurrent` already gives you parallelism.
+- **WIP / ack deadline extension** — while the batch handler is running, the consumer periodically (every `AckWait/3`, min 1s) sends `InProgress()` for every message in the batch, so long-running handlers do not get redelivered. Note that for very large batches (e.g. `BatchSize=1000`) this is `BatchSize` publishes per tick — tune `AckWait` and `BatchSize` together if this becomes noticeable.
+- **Shutdown** — `Shutdown()` cancels the consumer context. Any in-flight batches are `Nak()`'d immediately for redelivery. The graceful drain may wait up to `BatchMaxWait` for an in-progress `Fetch` to return.
+- **Backoff calculation** — when a batch is nacked, the delay is computed from the first message's `NumDelivered`; all messages in the batch get the same delay.
+- **`MaxConcurrent` × `BatchSize` ≤ `MaxAckPending`** — the total in-flight cap is `MaxConcurrent * BatchSize`. Keep `MaxAckPending` at least this large or the consumer will throttle on the ack-pending limit. The connector logs a warning at start-up if it detects this misconfiguration.
+- **`StartBatchAsync(handler)`** — non-blocking variant that runs the loop in a background goroutine; use `Done()` / `Shutdown()` for lifecycle.
+- **`StartBatchWithRestart(handler)`** — same restart wrapper as `StartWithRestart`; mainly catches handler panics, since the inner batch loop already retries on transient `Fetch` errors with `BatchMaxWait` backoff.
+
 ## Configuration
 
 Configuration is managed via Viper. All config keys are prefixed with the module's scope:
@@ -253,6 +301,18 @@ Starts consuming messages asynchronously (non-blocking).
 
 Starts consuming with automatic restart on failure (blocking). Panics in handlers are recovered and converted to errors. If the consumer crashes, it restarts with exponential backoff. Respects `MaxRestarts`, `RestartBaseDelay`, and `RestartMaxDelay` from config.
 
+#### `StartBatch(handler BatchMessageHandler) error`
+
+Starts consuming messages in batches synchronously (blocking). The handler receives up to `BatchSize` messages at a time. Returns when `Shutdown()` is called. See the **Batch Message Processing** section above for full semantics.
+
+#### `StartBatchAsync(handler BatchMessageHandler) error`
+
+Starts the batch consumer in a background goroutine and returns immediately. Use `Done()` / `Shutdown()` for lifecycle.
+
+#### `StartBatchWithRestart(handler BatchMessageHandler) error`
+
+Batch equivalent of `StartWithRestart`. Mainly recovers handler panics; the inner batch loop already handles transient `Fetch` errors internally.
+
 #### `Shutdown()`
 
 Gracefully shuts down the consumer. Also interrupts any pending restart backoff wait.
@@ -277,8 +337,20 @@ type WorkQueueConfig struct {
     MaxRestarts      int              // Max restart attempts; -1 unlimited, 0 no restart (default: -1)
     RestartBaseDelay time.Duration    // Restart backoff base delay (default: 1s)
     RestartMaxDelay  time.Duration    // Restart backoff max delay (default: 30s)
+
+    BatchSize    int           // Max messages per batch (default: 100). Used only by StartBatch* APIs.
+    BatchMaxWait time.Duration // Max time Fetch waits to fill a batch (default: 1s). Used only by StartBatch* APIs.
 }
 ```
+
+### MessageHandler / BatchMessageHandler
+
+```go
+type MessageHandler      func(ctx context.Context, msg jetstream.Msg) error
+type BatchMessageHandler func(ctx context.Context, msgs []jetstream.Msg) error
+```
+
+`MessageHandler` is for the single-message `Start*` family; the consumer acks on `nil`, nacks-with-backoff on `error`. `BatchMessageHandler` is for the `StartBatch*` family; the consumer acks the entire batch on `nil`, nacks the entire batch with backoff on `error`. Batch handlers MUST NOT call `msg.Ack()` / `msg.Nak()` / `msg.InProgress()` themselves.
 
 ## License
 

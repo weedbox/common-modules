@@ -169,6 +169,12 @@ func (c *NATSConnector) NewWorkQueueConsumer(streamName string, cfg WorkQueueCon
 	if cfg.MaxRetries == 0 {
 		cfg.MaxRetries = DefaultMaxRetries
 	}
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = DefaultBatchSize
+	}
+	if cfg.BatchMaxWait <= 0 {
+		cfg.BatchMaxWait = DefaultBatchMaxWait
+	}
 
 	if cfg.MaxRestarts != 0 || cfg.RestartBaseDelay != 0 || cfg.RestartMaxDelay != 0 {
 		if cfg.RestartBaseDelay <= 0 {

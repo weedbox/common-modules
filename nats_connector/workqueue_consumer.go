@@ -14,6 +14,12 @@ import (
 // Message handler function type definition
 type MessageHandler func(ctx context.Context, msg jetstream.Msg) error
 
+// Batch message handler function type definition.
+// Returning nil acks every message in the batch; returning an error nacks the
+// entire batch (with backoff). Handlers MUST NOT call Ack/Nak/InProgress on
+// individual messages — the consumer manages acknowledgement collectively.
+type BatchMessageHandler func(ctx context.Context, msgs []jetstream.Msg) error
+
 // Error handler function type definition
 type ErrorHandler func(err error)
 
@@ -28,6 +34,10 @@ const (
 	DefaultMaxRestarts      = -1              // Unlimited restarts
 	DefaultRestartBaseDelay = 1 * time.Second
 	DefaultRestartMaxDelay  = 30 * time.Second
+
+	// Default values for batch consumption
+	DefaultBatchSize    = 100
+	DefaultBatchMaxWait = 1 * time.Second
 )
 
 type WorkQueueConsumer struct {
@@ -53,6 +63,13 @@ type WorkQueueConfig struct {
 	MaxRestarts      int           // Max restart attempts; -1 unlimited, 0 no restart
 	RestartBaseDelay time.Duration // Restart backoff base delay (default 1s)
 	RestartMaxDelay  time.Duration // Restart backoff max delay (default 30s)
+
+	// BatchSize controls how many messages a single Fetch pulls in batch mode.
+	// Only consulted by the StartBatch* APIs.
+	BatchSize int
+	// BatchMaxWait is the maximum time Fetch will wait to fill a batch before
+	// returning whatever it has. Only consulted by the StartBatch* APIs.
+	BatchMaxWait time.Duration
 }
 
 func init() {
@@ -73,6 +90,8 @@ func NewWorkQueueConsumerConfig() WorkQueueConfig {
 		MaxRestarts:      DefaultMaxRestarts,
 		RestartBaseDelay: DefaultRestartBaseDelay,
 		RestartMaxDelay:  DefaultRestartMaxDelay,
+		BatchSize:        DefaultBatchSize,
+		BatchMaxWait:     DefaultBatchMaxWait,
 	}
 }
 
@@ -259,6 +278,227 @@ func (wqc *WorkQueueConsumer) processMessage(msg jetstream.Msg, handler MessageH
 		case <-wqc.ctx.Done():
 			// Shutdown while processing — nack for immediate redelivery on restart
 			_ = msg.Nak()
+			return
+		}
+	}
+}
+
+// StartBatch consumes messages in batches of up to BatchSize, calling handler
+// once per batch. Acks the whole batch on nil, nacks the whole batch with
+// backoff on error. Blocks until Shutdown() is called.
+func (wqc *WorkQueueConsumer) StartBatch(handler BatchMessageHandler) error {
+	wqc.warnIfBatchExceedsAckPending()
+	wqc.runBatchLoop(handler)
+	return nil
+}
+
+// StartBatchAsync starts the batch consumer in a background goroutine and
+// returns immediately. Use Shutdown() / Done() to control its lifecycle.
+func (wqc *WorkQueueConsumer) StartBatchAsync(handler BatchMessageHandler) error {
+	wqc.warnIfBatchExceedsAckPending()
+	wqc.wg.Add(1)
+	go func() {
+		defer wqc.wg.Done()
+		wqc.runBatchLoop(handler)
+	}()
+	return nil
+}
+
+// StartBatchWithRestart runs the batch consumer with automatic restart on
+// failure. Mirrors StartWithRestart for the single-message API.
+func (wqc *WorkQueueConsumer) StartBatchWithRestart(handler BatchMessageHandler) error {
+	attempt := 0
+	for {
+		attempt++
+		startErr := func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("batch consumer panic: %v", r)
+				}
+			}()
+			return wqc.StartBatch(handler)
+		}()
+
+		select {
+		case <-wqc.ctx.Done():
+			return nil
+		default:
+		}
+
+		if startErr != nil {
+			wqc.handleError(fmt.Errorf("batch consumer stopped with error (attempt %d): %w", attempt, startErr))
+		} else {
+			wqc.handleError(fmt.Errorf("batch consumer stopped unexpectedly (attempt %d)", attempt))
+		}
+
+		maxRestarts := wqc.config.MaxRestarts
+		if maxRestarts == 0 {
+			return fmt.Errorf("batch consumer stopped, restarts disabled")
+		}
+		if maxRestarts > 0 && attempt >= maxRestarts {
+			return fmt.Errorf("batch consumer exceeded max restarts (%d)", maxRestarts)
+		}
+
+		delay := wqc.restartDelay(attempt)
+		wqc.handleError(fmt.Errorf("restarting batch consumer in %s (attempt %d)", delay, attempt))
+		select {
+		case <-time.After(delay):
+		case <-wqc.ctx.Done():
+			return nil
+		}
+	}
+}
+
+func (wqc *WorkQueueConsumer) warnIfBatchExceedsAckPending() {
+	bs := wqc.config.BatchSize
+	if bs <= 0 {
+		bs = DefaultBatchSize
+	}
+	mc := wqc.config.MaxConcurrent
+	if mc <= 0 {
+		mc = DefaultMaxConcurrent
+	}
+	if wqc.config.MaxAckPending > 0 && bs*mc > wqc.config.MaxAckPending {
+		wqc.handleError(fmt.Errorf(
+			"batch in-flight cap (BatchSize=%d * MaxConcurrent=%d = %d) exceeds MaxAckPending=%d; consumer will throttle on ack-pending limit",
+			bs, mc, bs*mc, wqc.config.MaxAckPending,
+		))
+	}
+}
+
+func (wqc *WorkQueueConsumer) runBatchLoop(handler BatchMessageHandler) {
+	batchSize := wqc.config.BatchSize
+	if batchSize <= 0 {
+		batchSize = DefaultBatchSize
+	}
+	maxWait := wqc.config.BatchMaxWait
+	if maxWait <= 0 {
+		maxWait = DefaultBatchMaxWait
+	}
+	maxConcurrent := wqc.config.MaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = DefaultMaxConcurrent
+	}
+
+	semaphore := make(chan struct{}, maxConcurrent)
+
+	for {
+		select {
+		case <-wqc.ctx.Done():
+			return
+		case semaphore <- struct{}{}:
+		}
+
+		batch, err := wqc.fetchBatch(batchSize, maxWait)
+		if err != nil {
+			<-semaphore
+			if wqc.ctx.Err() != nil {
+				return
+			}
+			wqc.handleError(fmt.Errorf("batch fetch failed: %w", err))
+			select {
+			case <-time.After(maxWait):
+			case <-wqc.ctx.Done():
+				return
+			}
+			continue
+		}
+
+		if len(batch) == 0 {
+			<-semaphore
+			continue
+		}
+
+		wqc.wg.Add(1)
+		go func(msgs []jetstream.Msg) {
+			defer wqc.wg.Done()
+			defer func() { <-semaphore }()
+			wqc.processBatch(msgs, handler)
+		}(batch)
+	}
+}
+
+func (wqc *WorkQueueConsumer) fetchBatch(batchSize int, maxWait time.Duration) ([]jetstream.Msg, error) {
+	mb, err := wqc.consumer.Fetch(batchSize, jetstream.FetchMaxWait(maxWait))
+	if err != nil {
+		return nil, err
+	}
+
+	var batch []jetstream.Msg
+	for msg := range mb.Messages() {
+		batch = append(batch, msg)
+	}
+	if ferr := mb.Error(); ferr != nil {
+		// Drained messages are still valid; surface the error but return what we got.
+		wqc.handleError(fmt.Errorf("batch fetch reported error: %w", ferr))
+	}
+	return batch, nil
+}
+
+func (wqc *WorkQueueConsumer) processBatch(msgs []jetstream.Msg, handler BatchMessageHandler) {
+	if len(msgs) == 0 {
+		return
+	}
+
+	processCtx, cancel := context.WithCancel(wqc.ctx)
+	defer cancel()
+
+	interval := wqc.config.AckWait / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+
+	progressTicker := time.NewTicker(interval)
+	defer progressTicker.Stop()
+
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("batch handler panic: %v", r)
+			}
+		}()
+		done <- handler(processCtx, msgs)
+	}()
+
+	for {
+		select {
+		case err := <-done:
+			if wqc.ctx.Err() != nil {
+				for _, m := range msgs {
+					_ = m.Nak()
+				}
+				return
+			}
+
+			if err != nil {
+				wqc.handleError(fmt.Errorf("batch processing failed: %w", err))
+				delay := wqc.nakDelay(msgs[0])
+				for _, m := range msgs {
+					if nackErr := m.NakWithDelay(delay); nackErr != nil {
+						wqc.handleError(fmt.Errorf("failed to nack batch message after %s: %w", delay, nackErr))
+					}
+				}
+			} else {
+				for _, m := range msgs {
+					if ackErr := m.Ack(); ackErr != nil {
+						wqc.handleError(fmt.Errorf("failed to ack batch message: %w", ackErr))
+					}
+				}
+			}
+			return
+
+		case <-progressTicker.C:
+			for _, m := range msgs {
+				if perr := m.InProgress(); perr != nil {
+					wqc.handleError(fmt.Errorf("failed to send in progress for batch message: %w", perr))
+				}
+			}
+
+		case <-wqc.ctx.Done():
+			for _, m := range msgs {
+				_ = m.Nak()
+			}
 			return
 		}
 	}
