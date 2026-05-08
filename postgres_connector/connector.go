@@ -25,6 +25,13 @@ const (
 	DefaultSSLMode   = false
 	DefaultLogLevel  = gorm_logger.Error
 	DefaultDebugMode = false
+
+	// Connection pool defaults aligned with Go database/sql native defaults.
+	// Override via viper in production (typical: 50 / 25 / 1800 / 600).
+	DefaultMaxOpenConns    = 0 // 0 = unlimited
+	DefaultMaxIdleConns    = 2 // database/sql defaultMaxIdleConns
+	DefaultConnMaxLifetime = 0 // seconds, 0 = no expiration
+	DefaultConnMaxIdleTime = 0 // seconds, 0 = no expiration
 )
 
 type PostgresConnector struct {
@@ -88,6 +95,10 @@ func (c *PostgresConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("sslmode"), DefaultSSLMode)
 	viper.SetDefault(c.getConfigPath("loglevel"), DefaultLogLevel)
 	viper.SetDefault(c.getConfigPath("debug_mode"), DefaultDebugMode)
+	viper.SetDefault(c.getConfigPath("max_open_conns"), DefaultMaxOpenConns)
+	viper.SetDefault(c.getConfigPath("max_idle_conns"), DefaultMaxIdleConns)
+	viper.SetDefault(c.getConfigPath("conn_max_lifetime"), DefaultConnMaxLifetime)
+	viper.SetDefault(c.getConfigPath("conn_max_idle_time"), DefaultConnMaxIdleTime)
 }
 
 func (c *PostgresConnector) onStart(ctx context.Context) error {
@@ -106,11 +117,20 @@ func (c *PostgresConnector) onStart(ctx context.Context) error {
 		sslmode,
 	)
 
+	maxOpenConns := viper.GetInt(c.getConfigPath("max_open_conns"))
+	maxIdleConns := viper.GetInt(c.getConfigPath("max_idle_conns"))
+	connMaxLifetime := viper.GetInt(c.getConfigPath("conn_max_lifetime"))
+	connMaxIdleTime := viper.GetInt(c.getConfigPath("conn_max_idle_time"))
+
 	c.logger.Info("Starting PostgresConnector",
 		zap.String("host", viper.GetString(c.getConfigPath("host"))),
 		zap.Int("port", viper.GetInt(c.getConfigPath("port"))),
 		zap.String("dbname", viper.GetString(c.getConfigPath("dbname"))),
 		zap.Int("loglevel", viper.GetInt(c.getConfigPath("loglevel"))),
+		zap.Int("max_open_conns", maxOpenConns),
+		zap.Int("max_idle_conns", maxIdleConns),
+		zap.Int("conn_max_lifetime", connMaxLifetime),
+		zap.Int("conn_max_idle_time", connMaxIdleTime),
 	)
 
 	// Default logger configuration
@@ -144,6 +164,15 @@ func (c *PostgresConnector) onStart(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
+	}
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxIdleConns)
+	sqlDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
+	sqlDB.SetConnMaxIdleTime(time.Duration(connMaxIdleTime) * time.Second)
 
 	c.db = db
 

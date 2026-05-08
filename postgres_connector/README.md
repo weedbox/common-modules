@@ -184,6 +184,10 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 | `{scope}.sslmode` | `false` | Enable SSL connection |
 | `{scope}.loglevel` | `4` (Error) | GORM log level (1=Silent, 2=Error, 3=Warn, 4=Info) |
 | `{scope}.debug_mode` | `false` | Enable debug mode with detailed SQL logging |
+| `{scope}.max_open_conns` | `0` | Maximum open connections in the pool. `0` means unlimited (Go `database/sql` default). Set a finite value (e.g. `50`) in production to avoid exhausting PostgreSQL's `max_connections`. |
+| `{scope}.max_idle_conns` | `2` | Maximum idle connections kept in the pool (Go `database/sql` default). Raise this (e.g. `25`) under bursty load to reduce reconnection churn. |
+| `{scope}.conn_max_lifetime` | `0` | Maximum lifetime of a connection in seconds. `0` means no expiration. Set to e.g. `1800` (30 min) so connections rotate through PostgreSQL failovers and don't accumulate stale state. |
+| `{scope}.conn_max_idle_time` | `0` | Maximum time a connection can stay idle in the pool, in seconds. `0` means no expiration. Set to e.g. `600` (10 min) to release idle connections back to the server under low load. |
 
 ### TOML Configuration Example
 
@@ -197,6 +201,13 @@ password = "secret"
 sslmode = false
 loglevel = 4
 debug_mode = false
+
+# Connection pool tuning (defaults are 0 / 2 / 0 / 0 — i.e. Go database/sql
+# native defaults). The values below are typical production settings.
+max_open_conns = 50
+max_idle_conns = 25
+conn_max_lifetime = 1800   # 30 minutes
+conn_max_idle_time = 600   # 10 minutes
 ```
 
 ### Environment Variables Example
@@ -209,6 +220,10 @@ export DATABASE_USER=postgres
 export DATABASE_PASSWORD=secret
 export DATABASE_SSLMODE=false
 export DATABASE_DEBUG_MODE=true
+export DATABASE_MAX_OPEN_CONNS=50
+export DATABASE_MAX_IDLE_CONNS=25
+export DATABASE_CONN_MAX_LIFETIME=1800
+export DATABASE_CONN_MAX_IDLE_TIME=600
 ```
 
 ## API Reference
