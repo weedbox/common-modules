@@ -38,6 +38,10 @@ const (
 	// Default values for batch consumption
 	DefaultBatchSize    = 100
 	DefaultBatchMaxWait = 1 * time.Second
+
+	// Default values for transient-error backoff (fetch loop)
+	DefaultTransientBackoffBase = 500 * time.Millisecond
+	DefaultTransientBackoffMax  = 10 * time.Second
 )
 
 type WorkQueueConsumer struct {
@@ -70,6 +74,23 @@ type WorkQueueConfig struct {
 	// BatchMaxWait is the maximum time Fetch will wait to fill a batch before
 	// returning whatever it has. Only consulted by the StartBatch* APIs.
 	BatchMaxWait time.Duration
+
+	// IsTransientError, if set, classifies fetch errors. Errors that match
+	// are NOT reported via OnError and trigger exponential backoff in the
+	// fetch loop instead of being treated as application failures. Use this
+	// to swallow known transient cluster errors ("no responders", leader-
+	// flap, etc.) during cold-start or network blips, so the consumer waits
+	// quietly until the cluster stabilises instead of flooding logs with
+	// infrastructure errors that auto-recover on the next fetch.
+	//
+	// When nil, all fetch errors are reported to OnError (legacy behaviour).
+	IsTransientError func(error) bool
+
+	// TransientBackoffBase / TransientBackoffMax tune the exponential
+	// backoff (with jitter) applied when fetch returns a transient error.
+	// Zero values fall back to DefaultTransientBackoffBase / Max.
+	TransientBackoffBase time.Duration
+	TransientBackoffMax  time.Duration
 }
 
 func init() {
@@ -78,20 +99,23 @@ func init() {
 
 func NewWorkQueueConsumerConfig() WorkQueueConfig {
 	return WorkQueueConfig{
-		Conn:          nil, // Connection will be set later
-		Stream:        nil, // Stream will be set later
-		ConsumerName:  "default_consumer",
-		Subjects:      []string{"work_queue"},
-		MaxConcurrent: DefaultMaxConcurrent,
-		AckWait:       DefaultAckWait,
-		MaxRetries:    DefaultMaxRetries, // Default to unlimited retries
-		MaxAckPending:    DefaultMaxAckPending,
-		OnError:          nil,
-		MaxRestarts:      DefaultMaxRestarts,
-		RestartBaseDelay: DefaultRestartBaseDelay,
-		RestartMaxDelay:  DefaultRestartMaxDelay,
-		BatchSize:        DefaultBatchSize,
-		BatchMaxWait:     DefaultBatchMaxWait,
+		Conn:                 nil, // Connection will be set later
+		Stream:               nil, // Stream will be set later
+		ConsumerName:         "default_consumer",
+		Subjects:             []string{"work_queue"},
+		MaxConcurrent:        DefaultMaxConcurrent,
+		AckWait:              DefaultAckWait,
+		MaxRetries:           DefaultMaxRetries, // Default to unlimited retries
+		MaxAckPending:        DefaultMaxAckPending,
+		OnError:              nil,
+		MaxRestarts:          DefaultMaxRestarts,
+		RestartBaseDelay:     DefaultRestartBaseDelay,
+		RestartMaxDelay:      DefaultRestartMaxDelay,
+		BatchSize:            DefaultBatchSize,
+		BatchMaxWait:         DefaultBatchMaxWait,
+		IsTransientError:     nil, // Opt-in: callers wire their own classifier
+		TransientBackoffBase: DefaultTransientBackoffBase,
+		TransientBackoffMax:  DefaultTransientBackoffMax,
 	}
 }
 
@@ -382,6 +406,11 @@ func (wqc *WorkQueueConsumer) runBatchLoop(handler BatchMessageHandler) {
 
 	semaphore := make(chan struct{}, maxConcurrent)
 
+	// transientAttempt counts consecutive transient-error retries; reset on
+	// any successful fetch (including empty batches — empty means the
+	// fetch round completed normally and got no messages).
+	transientAttempt := 0
+
 	for {
 		select {
 		case <-wqc.ctx.Done():
@@ -395,6 +424,23 @@ func (wqc *WorkQueueConsumer) runBatchLoop(handler BatchMessageHandler) {
 			if wqc.ctx.Err() != nil {
 				return
 			}
+			// Transient cluster errors (cold-start "no responders", leader
+			// flap) auto-recover on the next fetch round. Swallow them
+			// silently with exponential backoff so we don't flood logs
+			// with infrastructure errors that aren't actionable. Only
+			// genuine non-transient failures get OnError + the standard
+			// maxWait delay.
+			if wqc.config.IsTransientError != nil && wqc.config.IsTransientError(err) {
+				transientAttempt++
+				delay := wqc.transientBackoff(transientAttempt)
+				select {
+				case <-time.After(delay):
+				case <-wqc.ctx.Done():
+					return
+				}
+				continue
+			}
+			transientAttempt = 0
 			wqc.handleError(fmt.Errorf("batch fetch failed: %w", err))
 			select {
 			case <-time.After(maxWait):
@@ -403,6 +449,8 @@ func (wqc *WorkQueueConsumer) runBatchLoop(handler BatchMessageHandler) {
 			}
 			continue
 		}
+
+		transientAttempt = 0
 
 		if len(batch) == 0 {
 			<-semaphore
@@ -418,6 +466,32 @@ func (wqc *WorkQueueConsumer) runBatchLoop(handler BatchMessageHandler) {
 	}
 }
 
+// transientBackoff returns the delay for the Nth consecutive transient-error
+// retry: base * 2^(attempt-1), capped at max, with ±20% jitter.
+func (wqc *WorkQueueConsumer) transientBackoff(attempt int) time.Duration {
+	base := wqc.config.TransientBackoffBase
+	if base <= 0 {
+		base = DefaultTransientBackoffBase
+	}
+	max := wqc.config.TransientBackoffMax
+	if max <= 0 {
+		max = DefaultTransientBackoffMax
+	}
+
+	delay := base * time.Duration(1<<(attempt-1))
+	if delay <= 0 || delay > max {
+		delay = max
+	}
+
+	jitterRange := delay / 5
+	if jitterRange < time.Millisecond {
+		jitterRange = time.Millisecond
+	}
+	jitter := time.Duration(rand.Int63n(int64(jitterRange)))
+
+	return delay + jitter
+}
+
 func (wqc *WorkQueueConsumer) fetchBatch(batchSize int, maxWait time.Duration) ([]jetstream.Msg, error) {
 	mb, err := wqc.consumer.Fetch(batchSize, jetstream.FetchMaxWait(maxWait))
 	if err != nil {
@@ -429,8 +503,13 @@ func (wqc *WorkQueueConsumer) fetchBatch(batchSize int, maxWait time.Duration) (
 		batch = append(batch, msg)
 	}
 	if ferr := mb.Error(); ferr != nil {
-		// Drained messages are still valid; surface the error but return what we got.
-		wqc.handleError(fmt.Errorf("batch fetch reported error: %w", ferr))
+		// Drained messages are still valid; the next fetch round will pick
+		// up where this one left off. Suppress transient cluster errors so
+		// they don't flood OnError — only genuine non-transient failures
+		// get reported.
+		if wqc.config.IsTransientError == nil || !wqc.config.IsTransientError(ferr) {
+			wqc.handleError(fmt.Errorf("batch fetch reported error: %w", ferr))
+		}
 	}
 	return batch, nil
 }
