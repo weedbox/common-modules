@@ -219,6 +219,56 @@ func (w *Worker) StartBatchConsumer() error {
 - **`StartBatchAsync(handler)`** — non-blocking variant that runs the loop in a background goroutine; use `Done()` / `Shutdown()` for lifecycle.
 - **`StartBatchWithRestart(handler)`** — same restart wrapper as `StartWithRestart`; mainly catches handler panics, since the inner batch loop already retries on transient `Fetch` errors with `BatchMaxWait` backoff.
 
+### Distributed Lock & Once
+
+Across multiple instances of the same service, the connector exposes a NATS JetStream-backed distributed lock and a `Once` helper for cross-instance "init exactly once" patterns. Typical use cases: schema migrations, stream/bucket bootstrapping, seed data, registering one-time external resources.
+
+```go
+// Low-level mutex: blocks until acquired or ctx is cancelled.
+lock, err := nc.NewLock(nats_connector.LockConfig{
+    Key: "user-module.migration",
+    TTL: 30 * time.Second, // lease, auto-released if the holder crashes
+})
+if err != nil { return err }
+
+if err := lock.Lock(ctx); err != nil { return err }
+defer lock.Unlock(ctx)
+
+// ... critical section ...
+```
+
+```go
+// High-level "init once across all instances": the first caller runs fn,
+// subsequent callers (in this run and future runs) skip it and return nil.
+err := nc.Once(ctx, "user-module.bootstrap", func(ctx context.Context) error {
+    return migrateSchema(ctx)
+})
+```
+
+**Semantics:**
+
+- The lock is implemented on a shared JetStream KV bucket (default `{scope}_locks`). The bucket is created lazily on first use. The lock key is `lock.<your-key>`, the `Once` done sentinel is `done.<your-key>`.
+- **Replication & single-mode** — the bucket defaults to `replicas=3` for HA on clustered JetStream. If the connected server is *not* part of a cluster (`ConnectedClusterName()` is empty), the connector silently caps the replica count to `1`. If the cluster is smaller than the requested replica count, the bucket creation is retried with `replicas=1` as a safety net.
+- **Atomic acquire** — `Create` on the KV bucket is atomic; only one caller wins, the rest see `ErrKeyExists` and either return `(false, nil)` from `TryLock` or block in `Lock` until the holder releases.
+- **Lease + heartbeat** — while held, the lock holder renews its lease (default every `TTL/3`). If the holder crashes, the per-key TTL on the bucket expires the key and another caller can take over. NATS server requires `TTL ≥ 1s`.
+- **CAS release** — `Unlock` uses `Delete` with `LastRevision`, so a stale holder cannot delete a lock that was already taken over by someone else.
+- **`Done()` channel** — closes when the lock is released, either by `Unlock` or because the heartbeat detected a loss (e.g. external purge, network split that ate the lease). Useful to abort the critical section.
+- **`Once` retries on failure** — if `fn` returns an error, the done sentinel is NOT written, so the next caller will run `fn` again. The done sentinel is permanent on success, making future runs near-zero-cost (single KV `Get`).
+- Lock blocking uses a KV `Watch`, so callers wake promptly when the lock is released (no busy polling).
+
+**`LockConfig`:**
+
+```go
+type LockConfig struct {
+    Key               string        // required: lock identity (mutually exclusive across instances)
+    Bucket            string        // optional: override default bucket name
+    TTL               time.Duration // lease duration (default: lock.defaultTTL; min: 1s)
+    HeartbeatInterval time.Duration // renewal interval (default: TTL/3)
+    OwnerID           string        // optional: identity stamped on the lock key (default: "<hostname>-<random>")
+    OnLost            func(error)   // optional: callback when heartbeat detects loss
+}
+```
+
 ## Configuration
 
 Configuration is managed via Viper. All config keys are prefixed with the module's scope:
@@ -234,6 +284,9 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 | `{scope}.tls.cert` | `""` | Path to TLS certificate |
 | `{scope}.tls.key` | `""` | Path to TLS key |
 | `{scope}.tls.ca` | `""` | Path to TLS CA certificate |
+| `{scope}.lock.bucket` | `{scope}_locks` | KV bucket name backing the distributed lock |
+| `{scope}.lock.replicas` | `3` | KV bucket replica count; automatically falls back to `1` when the server isn't clustered (or the cluster is too small to honour the requested count). |
+| `{scope}.lock.defaultTTL` | `30s` | Default lock lease when `LockConfig.TTL` is zero |
 
 ### TOML Configuration Example
 
@@ -286,6 +339,14 @@ Returns the JetStream context for stream operations.
 #### `NewWorkQueueConsumer(streamName string, cfg WorkQueueConfig) (*WorkQueueConsumer, error)`
 
 Creates a new work queue consumer for the specified stream.
+
+#### `NewLock(cfg LockConfig) (*Lock, error)`
+
+Creates a distributed lock backed by JetStream KV. See **Distributed Lock & Once** above.
+
+#### `Once(ctx context.Context, key string, fn func(context.Context) error) error`
+
+Runs `fn` exactly once across all instances. See **Distributed Lock & Once** above.
 
 ### WorkQueueConsumer
 

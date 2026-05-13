@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/spf13/viper"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -19,12 +20,17 @@ const (
 	DefaultMaxPingsOutstanding = 3
 	DefaultMaxReconnects       = -1
 	DefaultAccessKey           = ""
+
+	DefaultLockReplicas   = 3
+	DefaultLockTTL        = 30 * time.Second
+	DefaultLockBucketHint = "_locks" // suffix appended to scope
 )
 
 type NATSConnector struct {
 	logger *zap.Logger
 	conn   *nats.Conn
 	js     nats.JetStreamContext
+	jsv2   jetstream.JetStream
 	scope  string
 }
 
@@ -76,6 +82,10 @@ func (c *NATSConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("pingInterval"), DefaultPingInterval)
 	viper.SetDefault(c.getConfigPath("maxPingsOutstanding"), DefaultMaxPingsOutstanding)
 	viper.SetDefault(c.getConfigPath("maxReconnects"), DefaultMaxReconnects)
+
+	viper.SetDefault(c.getConfigPath("lock.bucket"), c.scope+DefaultLockBucketHint)
+	viper.SetDefault(c.getConfigPath("lock.replicas"), DefaultLockReplicas)
+	viper.SetDefault(c.getConfigPath("lock.defaultTTL"), DefaultLockTTL)
 }
 
 func (c *NATSConnector) onStart(ctx context.Context) error {
@@ -131,6 +141,14 @@ func (c *NATSConnector) onStart(ctx context.Context) error {
 
 	// JetStream
 	c.js, err = nc.JetStream()
+	if err != nil {
+		return err
+	}
+
+	// New-style JetStream client, used by the distributed lock / Once
+	// helpers (the legacy nats.JetStreamContext above is kept for backward
+	// compatibility with existing callers).
+	c.jsv2, err = jetstream.New(nc)
 	if err != nil {
 		return err
 	}
@@ -208,4 +226,53 @@ func (c *NATSConnector) GetConnection() *nats.Conn {
 
 func (c *NATSConnector) GetJetStreamContext() nats.JetStreamContext {
 	return c.js
+}
+
+// NewLock creates a distributed lock backed by the NATS JetStream KV bucket
+// configured via {scope}.lock.bucket. Multiple Lock instances with the same
+// Key are mutually exclusive across all NATS clients connected to the same
+// JetStream domain.
+func (c *NATSConnector) NewLock(cfg LockConfig) (*Lock, error) {
+	if c.jsv2 == nil {
+		return nil, fmt.Errorf("nats jetstream not initialized")
+	}
+	return newLock(c.jsv2, c.lockBucketName(), c.defaultLockTTL(), c.lockReplicas(), c.logger, cfg)
+}
+
+// Once runs fn exactly once across all instances sharing the same NATS
+// cluster, identified by key. The first caller to acquire the underlying
+// lock runs fn; subsequent callers (current and future) skip fn and return
+// nil once the first run completes successfully. If fn returns an error,
+// the next caller will retry.
+func (c *NATSConnector) Once(ctx context.Context, key string, fn func(context.Context) error) error {
+	if c.jsv2 == nil {
+		return fmt.Errorf("nats jetstream not initialized")
+	}
+	return runOnce(ctx, c.jsv2, c.lockBucketName(), c.defaultLockTTL(), c.lockReplicas(), c.logger, key, fn)
+}
+
+func (c *NATSConnector) lockBucketName() string {
+	return viper.GetString(c.getConfigPath("lock.bucket"))
+}
+
+func (c *NATSConnector) lockReplicas() int {
+	r := viper.GetInt(c.getConfigPath("lock.replicas"))
+	if r <= 0 {
+		r = DefaultLockReplicas
+	}
+	// If the connected NATS server isn't part of a cluster, JetStream
+	// rejects replicas > 1. Cap to 1 in that case so single-mode
+	// deployments keep working with the default config.
+	if r > 1 && c.conn != nil && c.conn.ConnectedClusterName() == "" {
+		return 1
+	}
+	return r
+}
+
+func (c *NATSConnector) defaultLockTTL() time.Duration {
+	d := viper.GetDuration(c.getConfigPath("lock.defaultTTL"))
+	if d <= 0 {
+		return DefaultLockTTL
+	}
+	return d
 }
