@@ -4,10 +4,10 @@ A common weedbox job scheduler module built on top of
 [`github.com/Weedbox/scheduler`](https://github.com/Weedbox/scheduler) and
 wired into [Uber Fx](https://github.com/uber-go/fx). Supports two backends:
 
-| Mode       | Backend                                             | Deployment                     |
-|------------|-----------------------------------------------------|--------------------------------|
-| `gorm`     | `*gorm.DB` + in-memory timer                        | **Single node only**           |
-| `nats`     | NATS 2.12+ JetStream Scheduled Message Delivery     | Single node + KV-backed restart |
+| Mode       | Backend                                             | Deployment                                  |
+|------------|-----------------------------------------------------|---------------------------------------------|
+| `gorm`     | `*gorm.DB` + in-memory timer                        | **Single node only**                        |
+| `nats`     | NATS 2.12+ JetStream Scheduled Message Delivery     | Multi-instance with KV-backed persistence   |
 
 The public API is identical in both modes — only `scheduler.mode` in config
 changes.
@@ -36,12 +36,28 @@ subjectPrefix = "scheduler"
 consumerName  = "scheduler-worker"
 jobBucket     = "SCHEDULER_JOBS"
 execBucket    = "SCHEDULER_EXECUTIONS"
+
+# Optional tuning knobs (omit to use upstream defaults)
+# duplicatesWindow         = "24h"   # stream-level dedup window
+# reconcilerInterval       = "30s"   # background republish reconciler
+# reconcilerGracePeriod    = "30s"   # lag tolerated before a job is treated as stuck
+# addJobRetryBudget        = "5s"    # AddJob/Update retry budget across raft hiccups
+# startupStreamReadyTimeout = "30s"  # wait for SCHEDULER stream raft leader
+# jetStreamReadyTimeout    = "30s"   # wait for JetStream metaleader
+# startPhaseTimeout        = "30s"   # per-phase cap inside Start()
+# onceKey                  = "scheduler.init"  # key used on the shared nats_connector lock bucket
+# [scheduler.nats.publishRetry]
+# attempts        = 3
+# initialBackoff  = "1s"
 ```
 
 In `gorm` mode the module also needs a
 [`database.DatabaseConnector`](../database/) to be provided (e.g.
 `sqlite_connector` or `postgres_connector`). In `nats` mode it needs
-[`nats_connector`](../nats_connector/).
+[`nats_connector`](../nats_connector/); the scheduler reuses the connector's
+distributed-once primitive (`NATSConnector.Once`) so first-deploy
+provisioning serializes through the same lock substrate as every other
+module.
 
 ## Quick Start
 
@@ -110,16 +126,20 @@ fx.New(
 
 Job definitions are persisted in a JetStream KV bucket and scheduled
 deliveries are published to a JetStream stream. On startup the scheduler
-purges stale in-flight messages and reloads jobs from KV, so a crashed
-process can be replaced by a fresh instance pointing at the same stream
-without losing or duplicating registered jobs.
+reloads jobs from KV and lets the shared durable consumer fan triggers out
+to whichever instance is free; stale messages left by a previous run are
+filtered against KV state in the message handler rather than purged from
+the stream. This keeps single-instance restarts and multi-instance load
+splitting on the same code path.
 
-> ⚠️ **Important:** Do not run multiple scheduler instances concurrently
-> against the same stream. Each `Start` purges the stream and recreates the
-> durable consumer, which disrupts any peer that is currently subscribed.
-> Run a single active instance; use NATS mode primarily for KV-backed
-> persistence and clean restart/failover semantics, not for concurrent
-> multi-node load splitting.
+**Multi-instance deployments.** Multiple scheduler replicas can run against
+the same stream concurrently. First-deploy provisioning of the stream, KV
+buckets, and durable consumer is serialized through a distributed-once
+primitive (sourced from `nats_connector`), and the durable consumer's
+work-queue semantics ensure each trigger is delivered to exactly one
+replica. Recurring chains survive replica crashes, leader re-elections,
+and rolling restarts; a background reconciler republishes any job whose
+next-run has slipped past its grace window.
 
 ## API
 
@@ -214,11 +234,14 @@ Schedule constructors live in the underlying library; import
   every process.
 - **`nats` mode** requires NATS Server **2.12 or later** with JetStream
   enabled. Startup will fail with `ErrNATSServerTooOld` on older servers.
-- On startup in NATS mode the library purges pending scheduled messages
-  from the previous run and reloads jobs from the KV bucket, so in-flight
-  triggers from a crashed run are not duplicated.
-- **NATS mode is single-active.** Each `Start` purges the stream and
-  recreates the durable consumer; running two instances against the same
-  stream will disrupt the existing one. The intended deployment is one
-  active scheduler with KV-backed restart/failover, not concurrent
-  multi-node fan-out.
+- On startup in NATS mode the library reloads jobs from the KV bucket and
+  filters stale in-flight scheduled messages against the persisted state
+  (rather than purging the stream), so a crashed run does not duplicate
+  triggers and a healthy peer is not disrupted.
+- **`nats` mode supports multi-instance deployments.** Replicas share the
+  same durable consumer; each scheduled message is delivered to exactly
+  one replica. First-deploy provisioning is serialized through
+  `nats_connector.Once`. The scheduler's background reconciler republishes
+  any recurring job whose next-run has slipped past
+  `nats.reconcilerGracePeriod` to recover from publish failures or
+  unclean shutdowns.

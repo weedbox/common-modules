@@ -541,3 +541,104 @@ func TestIntegration_NATSMode_FailoverReloadsJobs(t *testing.T) {
 			atomic.LoadInt32(&calls), beforeRestart)
 	}
 }
+
+// TestIntegration_NATSMode_ConcurrentInstances verifies that two scheduler
+// instances can run against the same JetStream stream simultaneously without
+// either disrupting the other — the multi-instance contract introduced
+// upstream. Previously each Start() purged the stream and recreated the
+// durable consumer; that has been replaced with KV-validated dedup so peers
+// coexist on a shared durable consumer.
+func TestIntegration_NATSMode_ConcurrentInstances(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	viper.Reset()
+	defer viper.Reset()
+
+	url := startEmbeddedNATSServer(t)
+
+	suffix := time.Now().UnixNano()
+	viper.Set("nats.host", url)
+	viper.Set("scheduler.mode", ModeNATS)
+	viper.Set("scheduler.nats.streamName", fmt.Sprintf("SCHED_%d", suffix))
+	viper.Set("scheduler.nats.subjectPrefix", "scheduler_mi")
+	viper.Set("scheduler.nats.consumerName", "scheduler-worker-mi")
+	viper.Set("scheduler.nats.jobBucket", fmt.Sprintf("SCHED_JOBS_%d", suffix))
+	viper.Set("scheduler.nats.execBucket", fmt.Sprintf("SCHED_EXEC_%d", suffix))
+
+	var callsA, callsB int32
+
+	build := func(counter *int32) (*fx.App, *SchedulerModule) {
+		var sm *SchedulerModule
+		app := fx.New(
+			fx.NopLogger,
+			cmlogger.Module(),
+			nats_connector.Module("nats"),
+			Module("scheduler"),
+			fx.Populate(&sm),
+			fx.Invoke(func(s *SchedulerModule) {
+				s.SetHandler(func(ctx context.Context, e libsched.JobEvent) error {
+					atomic.AddInt32(counter, 1)
+					return nil
+				})
+			}),
+			fx.Invoke(func(s *SchedulerModule) error {
+				sch, err := libsched.NewIntervalSchedule(500 * time.Millisecond)
+				if err != nil {
+					return err
+				}
+				return s.EnsureJob("multi-instance-job", sch, nil)
+			}),
+		)
+		return app, sm
+	}
+
+	startCtx, startCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer startCancel()
+
+	appA, smA := build(&callsA)
+	if err := appA.Start(startCtx); err != nil {
+		if errors.Is(err, libsched.ErrNATSServerTooOld) {
+			t.Skipf("embedded nats-server lacks AllowMsgSchedules support: %v", err)
+		}
+		t.Fatalf("fx start A: %v", err)
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = appA.Stop(stopCtx)
+	}()
+
+	// Bring up B while A is already serving. Both should provision through
+	// the shared Once primitive and both should see the same job in KV.
+	appB, smB := build(&callsB)
+	if err := appB.Start(startCtx); err != nil {
+		t.Fatalf("fx start B: %v", err)
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = appB.Stop(stopCtx)
+	}()
+
+	if jobs := smA.ListJobs(); len(jobs) != 1 {
+		t.Fatalf("instance A: expected 1 job, got %d", len(jobs))
+	}
+	if jobs := smB.ListJobs(); len(jobs) != 1 {
+		t.Fatalf("instance B: expected 1 job, got %d", len(jobs))
+	}
+
+	// The work-queue consumer fans triggers across the two replicas. We
+	// don't care which one fires; we just need a few total triggers within
+	// the window to confirm both peers are alive and consuming.
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) && atomic.LoadInt32(&callsA)+atomic.LoadInt32(&callsB) < 3 {
+		time.Sleep(100 * time.Millisecond)
+	}
+	total := atomic.LoadInt32(&callsA) + atomic.LoadInt32(&callsB)
+	if total < 3 {
+		t.Fatalf("expected at least 3 total fires across two instances, got %d (A=%d, B=%d)",
+			total, atomic.LoadInt32(&callsA), atomic.LoadInt32(&callsB))
+	}
+}

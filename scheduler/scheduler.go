@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	libsched "github.com/Weedbox/scheduler"
 	"github.com/nats-io/nats.go/jetstream"
@@ -112,6 +113,54 @@ func (m *SchedulerModule) initDefaultConfigs() {
 	viper.SetDefault(m.getConfigPath("nats.execBucket"), DefaultExecBucket)
 }
 
+// natsOptionsFromConfig collects optional tuning knobs for the NATS scheduler.
+// Each key is only forwarded when the user has explicitly set it; otherwise
+// the underlying library's default is preserved. Durations accept the usual
+// viper-friendly forms ("30s", "5m", or a numeric nanosecond value).
+func (m *SchedulerModule) natsOptionsFromConfig() []libsched.NATSSchedulerOption {
+	type durOpt struct {
+		key  string
+		bind func(time.Duration) libsched.NATSSchedulerOption
+	}
+
+	durations := []durOpt{
+		{"nats.duplicatesWindow", libsched.WithStreamDuplicatesWindow},
+		{"nats.reconcilerInterval", libsched.WithReconcilerInterval},
+		{"nats.reconcilerGracePeriod", libsched.WithReconcilerGracePeriod},
+		{"nats.addJobRetryBudget", libsched.WithAddJobRetryBudget},
+		{"nats.startupStreamReadyTimeout", libsched.WithStartupStreamReadyTimeout},
+		{"nats.jetStreamReadyTimeout", libsched.WithJetStreamReadyTimeout},
+		{"nats.startPhaseTimeout", libsched.WithStartPhaseTimeout},
+	}
+
+	var opts []libsched.NATSSchedulerOption
+	for _, d := range durations {
+		path := m.getConfigPath(d.key)
+		if !viper.IsSet(path) {
+			continue
+		}
+		opts = append(opts, d.bind(viper.GetDuration(path)))
+	}
+
+	if viper.IsSet(m.getConfigPath("nats.publishRetry.attempts")) ||
+		viper.IsSet(m.getConfigPath("nats.publishRetry.initialBackoff")) {
+		attempts := viper.GetInt(m.getConfigPath("nats.publishRetry.attempts"))
+		backoff := viper.GetDuration(m.getConfigPath("nats.publishRetry.initialBackoff"))
+		opts = append(opts, libsched.WithPublishRetry(attempts, backoff))
+	}
+
+	// WithOnceKey controls the key under which first-deploy provisioning
+	// serializes on the shared nats_connector lock bucket. WithOnceLockBucket
+	// is intentionally not exposed here: the bucket is owned by
+	// nats_connector and configured via its own `lock.bucket` key, not via
+	// the scheduler module.
+	if v := viper.GetString(m.getConfigPath("nats.onceKey")); v != "" {
+		opts = append(opts, libsched.WithOnceKey(v))
+	}
+
+	return opts
+}
+
 func (m *SchedulerModule) onStart(ctx context.Context) error {
 	mode := viper.GetString(m.getConfigPath("mode"))
 
@@ -139,7 +188,13 @@ func (m *SchedulerModule) onStart(ctx context.Context) error {
 			libsched.WithNATSSchedulerJobBucket(viper.GetString(m.getConfigPath("nats.jobBucket"))),
 			libsched.WithNATSSchedulerExecBucket(viper.GetString(m.getConfigPath("nats.execBucket"))),
 			libsched.WithNATSSchedulerCodec(m.codec),
+			libsched.WithNATSSchedulerLogger(zapNATSLogger(m.logger)),
+			// Share the distributed-once primitive with the rest of
+			// common-modules so first-deploy provisioning across all
+			// modules serializes through a single lock substrate.
+			libsched.WithOnce(m.nats.Once),
 		}
+		opts = append(opts, m.natsOptionsFromConfig()...)
 		sched = libsched.NewNATSScheduler(js, m.dispatch, opts...)
 
 	case ModeGorm:
@@ -333,4 +388,23 @@ func copyMetadata(src map[string]string) map[string]string {
 		dst[k] = v
 	}
 	return dst
+}
+
+// zapNATSLogger adapts the upstream NATSSchedulerLogger callback (msg + flat
+// key/value pairs) onto a zap.Logger. Non-fatal errors from the NATS scheduler
+// (KV puts, next-tick publishes, reconciler hiccups) are emitted at warn
+// level. Without an adapter installed the upstream library drops them
+// silently.
+func zapNATSLogger(l *zap.Logger) libsched.NATSSchedulerLogger {
+	return func(msg string, keysAndValues ...any) {
+		fields := make([]zap.Field, 0, len(keysAndValues)/2)
+		for i := 0; i+1 < len(keysAndValues); i += 2 {
+			key, ok := keysAndValues[i].(string)
+			if !ok {
+				key = fmt.Sprintf("%v", keysAndValues[i])
+			}
+			fields = append(fields, zap.Any(key, keysAndValues[i+1]))
+		}
+		l.Warn(msg, fields...)
+	}
 }
