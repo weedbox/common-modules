@@ -9,6 +9,7 @@ A NATS messaging connector module built on [NATS Go Client](https://github.com/n
 - JetStream support for persistent messaging
 - Work queue consumer with concurrency control
 - Batch message processing for bulk-friendly handlers
+- Batch publishing (cross-stream async fan-out) and single-stream atomic publishing
 - Automatic panic recovery and consumer restart with exponential backoff
 - Authentication support (credentials, NKey)
 - TLS support
@@ -219,6 +220,115 @@ func (w *Worker) StartBatchConsumer() error {
 - **`StartBatchAsync(handler)`** — non-blocking variant that runs the loop in a background goroutine; use `Done()` / `Shutdown()` for lifecycle.
 - **`StartBatchWithRestart(handler)`** — same restart wrapper as `StartWithRestart`; mainly catches handler panics, since the inner batch loop already retries on transient `Fetch` errors with `BatchMaxWait` backoff.
 
+### Batch Publishing
+
+The connector exposes two distinct entry points for publishing many
+messages at once. Pick based on whether you need atomic semantics:
+
+| API | Stream scope | Guarantee | Use when |
+|-----|--------------|-----------|----------|
+| `BatchPublish` | Items may target subjects across **multiple streams** | None — async fan-out, per-item ack | Bulk publishing for throughput; no transactional requirement |
+| `AtomicPublish` | All items must target a **single stream** | All-or-nothing when stream supports atomic batch; transparent fallback to async otherwise | You want one-shot commit semantics where possible |
+
+#### BatchPublish (cross-stream, async)
+
+```go
+items := []nats_connector.BatchPublishItem{
+    {Subject: "events.created", Data: payload1},
+    {Subject: "audit.created",  Data: payload2}, // different stream is fine
+    {Subject: "events.created", Data: payload3},
+}
+
+res, err := nc.BatchPublish(ctx, items)
+if err != nil {
+    return err
+}
+for i, ack := range res.Acks {
+    log.Printf("item %d → stream=%s seq=%d", i, ack.Stream, ack.Sequence)
+}
+```
+
+`BatchPublish` calls `PublishMsgAsync` for every item and waits for all
+acks. There is no atomic semantic: each item is independently confirmed.
+If any item's ack returns an error the call returns the first error and
+abandons the rest.
+
+**Options:**
+
+- `WithBatchTimeout(d)` — overall wait cap; default 30s. Only consulted
+  when the caller's context has no deadline.
+
+#### AtomicPublish (single stream, atomic-or-fallback)
+
+```go
+res, err := nc.AtomicPublish(ctx, items)
+if err != nil {
+    return err
+}
+log.Printf("published %d msgs via %s (stream=%s, seq=%d..%d, batch=%s)",
+    res.Count, res.Mode, res.Stream, res.FirstSeq, res.LastSeq, res.BatchID)
+```
+
+`AtomicPublish` resolves the target stream from the first item's subject
+(or `WithAtomicStream`) and uses JetStream Atomic Batch Publish when the
+stream advertises `AllowAtomicPublish` (NATS 2.12+). When the stream
+does not support atomic batches, it transparently falls back to async
+fan-out and returns `Mode == AtomicPublishModeAsyncFallback`. Use
+`WithStrictAtomic` to disable the fallback.
+
+**Options:**
+
+- `WithAtomicStream(name)` — explicit stream name; skips the
+  `StreamNameBySubject` lookup. Required when subjects are bound to more
+  than one stream.
+- `WithAtomicTimeout(d)` — overrides the commit/wait timeout (default
+  30s). Only consulted when the caller's context has no deadline.
+- `WithAtomicID(id)` — supplies an explicit `Nats-Batch-Id` (otherwise
+  auto-generated).
+- `WithStrictAtomic()` — disables the async fallback. Returns an error
+  if the target stream does not support atomic batch publish.
+
+**Semantics:**
+
+- **Atomic path** — `len(items)-1` non-commit messages are published via
+  `conn.PublishMsg`, then the last item is sent via `RequestMsg` with
+  `Nats-Batch-Commit: 1`. The aggregate ack carries the batch id, the
+  count, and the last assigned stream sequence; `FirstSeq` is derived
+  as `LastSeq - Count + 1`. `Acks` is empty (the server returns one
+  aggregate ack, not per-item acks).
+- **Fallback path** — same as `BatchPublish` for the same items.
+  `BatchID` is empty and `Acks` is populated in input order.
+- **Header preservation** — `BatchPublishItem.Header` is cloned per
+  message; in atomic mode the connector injects the batch headers on
+  top of the caller's headers.
+- **Partial-failure recovery** — if an intermediate publish errors or
+  the caller cancels `ctx` before commit, the partial batch staged on
+  the server is discarded automatically when its atomic-batch timeout
+  elapses; you can safely retry with a fresh call (the connector
+  generates a new `Nats-Batch-Id` on each retry unless you pin one
+  with `WithAtomicID`).
+- **Commit ambiguity** — if the commit `RequestMsg` times out or the
+  connection drops after the commit reaches the server, the server may
+  still apply the batch while the caller observes an error. The
+  outcome is indeterminable without correlating via your own
+  application-level dedup key.
+
+#### Enabling atomic batch on a stream
+
+```go
+js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+    Name:               "EVENTS",
+    Subjects:           []string{"events.>"},
+    AllowAtomicPublish: true, // required for AtomicPublish to use the atomic path
+})
+```
+
+Atomic batch publish is not propagated through mirrors or source
+streams: the server strips `Nats-Batch-*` headers when replicating, so
+downstream readers cannot reconstruct the batch boundary. If your
+consumers need that, carry your own correlation header (e.g.
+`X-Tx-Id`).
+
 ### Distributed Lock & Once
 
 Across multiple instances of the same service, the connector exposes a NATS JetStream-backed distributed lock and a `Once` helper for cross-instance "init exactly once" patterns. Typical use cases: schema migrations, stream/bucket bootstrapping, seed data, registering one-time external resources.
@@ -339,6 +449,17 @@ Returns the JetStream context for stream operations.
 #### `NewWorkQueueConsumer(streamName string, cfg WorkQueueConfig) (*WorkQueueConsumer, error)`
 
 Creates a new work queue consumer for the specified stream.
+
+#### `BatchPublish(ctx context.Context, items []BatchPublishItem, opts ...BatchPublishOption) (*BatchPublishResult, error)`
+
+Publishes a slice of messages via async fan-out. Items may target
+subjects bound to different streams. See **Batch Publishing** above.
+
+#### `AtomicPublish(ctx context.Context, items []BatchPublishItem, opts ...AtomicPublishOption) (*AtomicPublishResult, error)`
+
+Publishes a slice of messages targeting a single stream, preferring
+JetStream Atomic Batch Publish and falling back to async fan-out when
+the stream does not support it. See **Batch Publishing** above.
 
 #### `NewLock(cfg LockConfig) (*Lock, error)`
 
