@@ -45,6 +45,8 @@ execBucket    = "SCHEDULER_EXECUTIONS"
 # startupStreamReadyTimeout = "30s"  # wait for SCHEDULER stream raft leader
 # jetStreamReadyTimeout    = "30s"   # wait for JetStream metaleader
 # startPhaseTimeout        = "30s"   # per-phase cap inside Start()
+# loadJobsConcurrency      = 32      # worker pool size for parallel KV reads at startup
+# loadJobsAsyncPublishTimeout = "30s" # cap for draining startup async publishes
 # onceKey                  = "scheduler.init"  # key used on the shared nats_connector lock bucket
 # [scheduler.nats.publishRetry]
 # attempts        = 3

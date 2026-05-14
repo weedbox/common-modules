@@ -131,6 +131,7 @@ func (m *SchedulerModule) natsOptionsFromConfig() []libsched.NATSSchedulerOption
 		{"nats.startupStreamReadyTimeout", libsched.WithStartupStreamReadyTimeout},
 		{"nats.jetStreamReadyTimeout", libsched.WithJetStreamReadyTimeout},
 		{"nats.startPhaseTimeout", libsched.WithStartPhaseTimeout},
+		{"nats.loadJobsAsyncPublishTimeout", libsched.WithLoadJobsAsyncPublishTimeout},
 	}
 
 	var opts []libsched.NATSSchedulerOption
@@ -140,6 +141,10 @@ func (m *SchedulerModule) natsOptionsFromConfig() []libsched.NATSSchedulerOption
 			continue
 		}
 		opts = append(opts, d.bind(viper.GetDuration(path)))
+	}
+
+	if path := m.getConfigPath("nats.loadJobsConcurrency"); viper.IsSet(path) {
+		opts = append(opts, libsched.WithLoadJobsConcurrency(viper.GetInt(path)))
 	}
 
 	if viper.IsSet(m.getConfigPath("nats.publishRetry.attempts")) ||
