@@ -170,6 +170,49 @@ func main() {
 }
 ```
 
+## Loading Multiple Connectors
+
+`sqlite_connector` and `postgres_connector` can be loaded into the same `fx.App` simultaneously — for example to run SQLite for a local cache alongside a PostgreSQL primary. Each `Module(scope)` call always registers a named `database.DatabaseConnector` keyed by its `scope`, so consumers disambiguate using fx's `name` tag:
+
+```go
+type Params struct {
+    fx.In
+
+    Cache database.DatabaseConnector `name:"cache"`   // sqlite
+    Main  database.DatabaseConnector `name:"main"`    // postgres
+}
+
+func main() {
+    fx.New(
+        logger.Module(),
+        sqlite_connector.Module("cache"),
+        postgres_connector.Module("main"),
+        fx.Invoke(func(p Params) { /* use p.Cache, p.Main */ }),
+    ).Run()
+}
+```
+
+The **first** connector module loaded into the process (across all `database.DatabaseConnector` implementations) also exposes itself as the **unnamed default**, so existing single-load code that injects `database.DatabaseConnector` without a tag keeps working with zero changes. Load order controls which connector becomes the default. If load order is brittle, always inject by named tag in multi-load setups.
+
+### Test caveat: ResetClaim between fx.Apps
+
+The "first call wins" claim on the unnamed default uses process-level state. Tests that build more than one `fx.App` in the same process must reset that claim between apps, otherwise later apps cannot register an unnamed default:
+
+```go
+import "github.com/weedbox/weedbox/fxmodule"
+
+func TestSomething(t *testing.T) {
+    fxmodule.ResetClaim[database.DatabaseConnector]()
+    t.Cleanup(func() { fxmodule.ResetClaim[database.DatabaseConnector]() })
+
+    app := fx.New(
+        sqlite_connector.Module("database"),
+        // ...
+    )
+    // ...
+}
+```
+
 ## Configuration
 
 Configuration is managed via Viper. All config keys are prefixed with the module's scope:

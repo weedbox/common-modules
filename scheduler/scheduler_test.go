@@ -14,12 +14,24 @@ import (
 	libsched "github.com/Weedbox/scheduler"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/spf13/viper"
+	"github.com/weedbox/common-modules/database"
 	cmlogger "github.com/weedbox/common-modules/logger"
 	"github.com/weedbox/common-modules/nats_connector"
 	"github.com/weedbox/common-modules/sqlite_connector"
+	"github.com/weedbox/weedbox/fxmodule"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 )
+
+// resetDBClaim clears the process-wide claim on the unnamed
+// database.DatabaseConnector default. Tests that build multiple fx.Apps in
+// the same process must call this before each fx.New that loads a connector,
+// otherwise only the first app in the run gets an unnamed default.
+func resetDBClaim(t *testing.T) {
+	t.Helper()
+	fxmodule.ResetClaim[database.DatabaseConnector]()
+	t.Cleanup(func() { fxmodule.ResetClaim[database.DatabaseConnector]() })
+}
 
 // newTestModule constructs a SchedulerModule without going through fx, so
 // low-level dispatcher and pending-queue behavior can be tested in isolation.
@@ -212,6 +224,7 @@ func TestIntegration_GormMode_HandlerFires(t *testing.T) {
 
 	viper.Reset()
 	defer viper.Reset()
+	resetDBClaim(t)
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "scheduler.db")
@@ -287,6 +300,7 @@ func TestIntegration_GormMode_EnsureJobIdempotentAcrossRestart(t *testing.T) {
 
 	runOnce := func(t *testing.T) int {
 		t.Helper()
+		resetDBClaim(t)
 		var sm *SchedulerModule
 		app := fx.New(
 			fx.NopLogger,
