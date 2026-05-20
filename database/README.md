@@ -27,6 +27,32 @@ type DatabaseConnector interface {
 - [postgres_connector](../postgres_connector) - PostgreSQL database connector
 - [sqlite_connector](../sqlite_connector) - SQLite database connector
 
+## Implementing Your Own Connector
+
+A new connector backing the `DatabaseConnector` interface only needs to
+expose a `Module(scope string) fx.Option` factory that wires its
+constructor through `database.Module`:
+
+```go
+func Module(scope string) fx.Option {
+    return database.Module(scope, func(p Params) database.DatabaseConnector {
+        c := &MyConnector{ /* ... */ }
+        p.Lifecycle.Append(fx.Hook{OnStart: c.onStart, OnStop: c.onStop})
+        return c
+    })
+}
+```
+
+`database.Module` is a thin wrapper around
+`weedbox/fxmodule.InterfaceModule[DatabaseConnector]` that handles the
+shared multi-load wiring: the connector is always registered as
+`name:"<scope>"`, and the first connector loaded into the process also
+exposes itself as the unnamed default so existing single-load consumers
+that inject `DatabaseConnector` without a tag keep working.
+
+Tests that build multiple `fx.App`s in the same process must call
+`fxmodule.ResetClaim[database.DatabaseConnector]()` between apps.
+
 ## Usage
 
 ### Injecting Database Connector

@@ -12,7 +12,7 @@ require (
 	github.com/spf13/viper v1.21.0
 	github.com/swaggo/files v1.0.1
 	github.com/swaggo/gin-swagger v1.6.1
-	github.com/weedbox/weedbox v0.0.1
+	github.com/weedbox/weedbox v0.0.2
 	go.uber.org/fx v1.24.0
 	go.uber.org/zap v1.27.1
 	gopkg.in/gomail.v2 v2.0.0-20160411212932-81ebce5c23df

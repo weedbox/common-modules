@@ -12,7 +12,6 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/weedbox/common-modules/database"
-	"github.com/weedbox/weedbox/fxmodule"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 	"gorm.io/driver/sqlite"
@@ -58,18 +57,10 @@ type Params struct {
 
 // Module registers a SQLite-backed database.DatabaseConnector.
 //
-// The connector is always registered as a named instance tagged with the
-// given scope, so callers can disambiguate between multiple connector
-// modules loaded in the same process via `name:"<scope>"`. The first
-// Module() call (across all connectors of this interface within a process)
-// also exposes itself as the unnamed default for backwards compatibility;
-// subsequent calls only contribute their named instance.
-//
-// In test code that constructs multiple fx.Apps, call
-// fxmodule.ResetClaim[database.DatabaseConnector]() between apps to allow
-// each one to claim the unnamed default slot.
+// Wiring (multi-load semantics, ResetClaim test caveat, etc.) is handled
+// by database.Module — see that helper's doc for details.
 func Module(scope string) fx.Option {
-	ctor := func(p Params) database.DatabaseConnector {
+	return database.Module(scope, func(p Params) database.DatabaseConnector {
 		c := &SQLiteConnector{
 			params: p,
 			logger: p.Logger.Named(scope),
@@ -81,16 +72,7 @@ func Module(scope string) fx.Option {
 			OnStop:  c.onStop,
 		})
 		return c
-	}
-
-	opts := []fx.Option{
-		fxmodule.Provide(scope, ctor),
-		fxmodule.Invoke(scope, func(c database.DatabaseConnector) {}),
-	}
-	if fxmodule.ClaimDefault[database.DatabaseConnector]() {
-		opts = append(opts, fxmodule.Alias[database.DatabaseConnector](scope))
-	}
-	return fx.Module(scope, opts...)
+	})
 }
 
 func (c *SQLiteConnector) getConfigPath(key string) string {
