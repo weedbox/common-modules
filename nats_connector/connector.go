@@ -236,6 +236,21 @@ func (c *NATSConnector) GetJetStream() jetstream.JetStream {
 	return c.jsv2
 }
 
+// ensureOpts returns the EnsureOption set the method-form helpers apply
+// transparently: the connector's logger, plus a zero insufficient-peers
+// budget when the connected NATS server is not part of a cluster. The
+// budget is meant to absorb a fresh multi-node cluster's bootstrap
+// window — on a single-node deployment "insufficient peers" is permanent,
+// so paying the budget per call just multiplies startup latency without
+// any chance of recovery. Mirrors the single-node guard in lockReplicas.
+func (c *NATSConnector) ensureOpts() []EnsureOption {
+	opts := []EnsureOption{WithEnsureLogger(c.logger)}
+	if c.conn != nil && c.conn.ConnectedClusterName() == "" {
+		opts = append(opts, WithInsufficientPeersBudget(0))
+	}
+	return opts
+}
+
 // EnsureKV provisions a JetStream KV bucket safely across multiple
 // instances. Method form of the package-level EnsureKV; supplies the
 // connector's JetStream handle and logger.
@@ -243,7 +258,7 @@ func (c *NATSConnector) EnsureKV(ctx context.Context, cfg jetstream.KeyValueConf
 	if c.jsv2 == nil {
 		return nil, fmt.Errorf("nats jetstream not initialized")
 	}
-	return EnsureKV(ctx, c.jsv2, cfg, WithEnsureLogger(c.logger))
+	return EnsureKV(ctx, c.jsv2, cfg, c.ensureOpts()...)
 }
 
 // EnsureStream provisions a JetStream stream safely across multiple
@@ -252,7 +267,7 @@ func (c *NATSConnector) EnsureStream(ctx context.Context, cfg jetstream.StreamCo
 	if c.jsv2 == nil {
 		return nil, fmt.Errorf("nats jetstream not initialized")
 	}
-	return EnsureStream(ctx, c.jsv2, cfg, WithEnsureLogger(c.logger))
+	return EnsureStream(ctx, c.jsv2, cfg, c.ensureOpts()...)
 }
 
 // EnsureConsumer provisions a durable consumer on the given stream safely
@@ -261,7 +276,7 @@ func (c *NATSConnector) EnsureConsumer(ctx context.Context, stream jetstream.Str
 	if c.jsv2 == nil {
 		return nil, fmt.Errorf("nats jetstream not initialized")
 	}
-	return EnsureConsumer(ctx, stream, cfg, WithEnsureLogger(c.logger))
+	return EnsureConsumer(ctx, stream, cfg, c.ensureOpts()...)
 }
 
 // EnsureReplicaScale opportunistically promotes an existing stream toward
@@ -271,7 +286,7 @@ func (c *NATSConnector) EnsureReplicaScale(ctx context.Context, streamName strin
 	if c.jsv2 == nil {
 		return
 	}
-	EnsureReplicaScale(ctx, c.jsv2, streamName, desired, WithEnsureLogger(c.logger))
+	EnsureReplicaScale(ctx, c.jsv2, streamName, desired, c.ensureOpts()...)
 }
 
 // NewLock creates a distributed lock backed by the NATS JetStream KV bucket

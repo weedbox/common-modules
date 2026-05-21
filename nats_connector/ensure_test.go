@@ -499,6 +499,62 @@ func TestEnsureReplicaScale_NoopOnCurrentGEDesired(t *testing.T) {
 
 // --- NATSConnector method form ----------------------------------------------
 
+// TestNATSConnector_EnsureMethodSkipsBudgetOnSingleNode verifies the
+// method-form helpers auto-skip the insufficient-peers budget when the
+// connected server reports an empty cluster name (single-node deploy
+// / embedded test server). Without the skip, requesting Replicas=3 would
+// pay the full DefaultInsufficientPeersBudget (30s) per call before
+// falling back to 1 — multiplying onStart latency for no recoverable
+// gain on a deployment that will never grow more peers.
+func TestNATSConnector_EnsureMethodSkipsBudgetOnSingleNode(t *testing.T) {
+	r := newRig(t)
+	c := connectorOnRig(r)
+	ctx := context.Background()
+
+	if name := r.nc.ConnectedClusterName(); name != "" {
+		t.Fatalf("expected empty ConnectedClusterName on test rig, got %q", name)
+	}
+
+	// Use a generous-but-finite ctx — far shorter than the 30s default
+	// budget, so a regression to the buget-applied path would surface as
+	// ctx.DeadlineExceeded rather than a slow pass.
+	deadline := 5 * time.Second
+	start := time.Now()
+	kvCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	kv, err := c.EnsureKV(kvCtx, jetstream.KeyValueConfig{
+		Bucket:   "method_single_node_kv",
+		Replicas: 3,
+	})
+	if err != nil {
+		t.Fatalf("EnsureKV under single-node rig: %v", err)
+	}
+	if kv == nil {
+		t.Fatalf("nil KV handle")
+	}
+	if elapsed := time.Since(start); elapsed > deadline/2 {
+		t.Fatalf("EnsureKV took %v — expected immediate fallback on single node", elapsed)
+	}
+
+	streamStart := time.Now()
+	streamCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	stream, err := c.EnsureStream(streamCtx, jetstream.StreamConfig{
+		Name:     "METHOD_SINGLE_NODE_STREAM",
+		Subjects: []string{"method.single.>"},
+		Replicas: 3,
+	})
+	if err != nil {
+		t.Fatalf("EnsureStream under single-node rig: %v", err)
+	}
+	if stream == nil {
+		t.Fatalf("nil stream handle")
+	}
+	if elapsed := time.Since(streamStart); elapsed > deadline/2 {
+		t.Fatalf("EnsureStream took %v — expected immediate fallback on single node", elapsed)
+	}
+}
+
 func TestNATSConnector_GetJetStreamReturnsHandle(t *testing.T) {
 	r := newRig(t)
 	c := connectorOnRig(r)
