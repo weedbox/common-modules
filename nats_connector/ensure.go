@@ -86,25 +86,34 @@ func WithoutReplicaFallback() EnsureOption {
 }
 
 // EnsureKV provisions a JetStream KV bucket and blocks until the
-// underlying KV_<bucket> stream is ready for reads/writes, or ctx is done.
+// underlying KV_<bucket> stream is publishable, or ctx is done.
 //
 // Designed to be safe under multi-process cold start without external
 // coordination:
 //
+//   - Lookup-first: every iteration starts with js.KeyValue + stream-info
+//     for the underlying KV_<bucket> stream. If a leader is already
+//     elected, the bucket is publishable and the call returns without
+//     issuing a CreateOrUpdate. This avoids re-driving server-side Raft
+//     activity on every retry when an existing bucket is mid-scale or
+//     mid-catch-up, which can otherwise stall the loop for the full ctx
+//     budget on streams whose new replicas can't become Current quickly.
 //   - The NATS server's meta-leader serializes CreateOrUpdateKeyValue by
-//     bucket name, so concurrent callers either all match the same config
-//     (idempotent — every caller succeeds) or one peer wins and the others
-//     surface "bucket already exists" (recoverable, loops back to verify
-//     ready).
+//     bucket name, so when the lookup misses, concurrent callers either
+//     match the same config (idempotent) or one wins and the others surface
+//     "bucket already exists" — both fall back to the next lookup.
 //   - Transient cold-start errors (no responders, leader-flap, "no response
 //     from stream", etc.) are absorbed by the retry loop.
-//   - "Insufficient peers" demotes cfg.Replicas to 1 and retries, which
-//     lets a single-node deployment provision the same bucket without the
-//     caller having to know the cluster topology. Once the bucket is
-//     ready EnsureReplicaScale runs a best-effort promotion toward the
-//     original Replicas, which makes a cluster that later grows from
-//     1-node to 3-node self-heal on the next call. Disable via
+//   - "Insufficient peers" demotes cfg.Replicas to 1 and retries. Once the
+//     bucket is publishable EnsureReplicaScale runs a best-effort promotion
+//     toward the original Replicas, which makes a cluster that later grows
+//     from 1-node to 3-node self-heal on the next call. Disable via
 //     WithoutReplicaFallback().
+//
+// Config drift on an existing bucket is intentionally NOT reconciled here:
+// the lookup-first short-circuits the CreateOrUpdate path when the bucket
+// is publishable. Callers needing drift reconciliation should issue an
+// explicit js.UpdateStream / js.CreateOrUpdateKeyValue outside this helper.
 //
 // ctx is the only deadline. Aborts immediately on ctx cancellation. Returns
 // the resolved KeyValue handle on success.
@@ -127,15 +136,27 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 			return nil, err
 		}
 
-		kv, err := js.CreateOrUpdateKeyValue(ctx, cfg)
-		switch {
-		case err == nil:
-			if isJetStreamKVReady(ctx, js, cfg.Bucket) {
+		// Lookup-first fast path.
+		if kv, err := js.KeyValue(ctx, cfg.Bucket); err == nil {
+			if isJetStreamKVPublishable(ctx, js, cfg.Bucket) {
 				ensureReplicaScale(ctx, js, "KV_"+cfg.Bucket, desiredReplicas, o)
 				return kv, nil
 			}
-			// Bucket exists but underlying stream not yet publishable.
-			// Loop back to retry the readiness check.
+			// Bucket exists but underlying stream has no elected leader —
+			// wait for Raft to settle instead of re-issuing CreateOrUpdate.
+			if err := sleepBackoff(ctx, &backoff, o.maxBackoff); err != nil {
+				return nil, err
+			}
+			continue
+		} else if !errors.Is(err, jetstream.ErrBucketNotFound) && !isTransientJetStreamError(err) {
+			return nil, fmt.Errorf("lookup kv bucket %s: %w", cfg.Bucket, err)
+		}
+
+		_, err := js.CreateOrUpdateKeyValue(ctx, cfg)
+		switch {
+		case err == nil:
+			// Loop back so the next iteration's lookup-first path picks up
+			// the handle and runs the publishable check.
 
 		case isInsufficientPeers(err) && o.fallbackOnInsufficientPeers && cfg.Replicas > EnsureFallbackReplicas:
 			logEvent(o.logger, "convergent: KV create rejected at default replica count, falling back to single replica",
@@ -145,7 +166,8 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 			cfg.Replicas = EnsureFallbackReplicas
 
 		case isAlreadyInUse(err) || isTransientJetStreamError(err):
-			// peer is mid-create or burst-induced transient — verify ready.
+			// peer is mid-create or burst-induced transient — fall through
+			// to the next lookup.
 
 		default:
 			return nil, fmt.Errorf("create-or-update kv bucket %s: %w", cfg.Bucket, err)
@@ -157,13 +179,30 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 	}
 }
 
-// EnsureStream provisions a JetStream stream and blocks until it
-// is publishable (leader elected, replicas current), or ctx is done.
+// EnsureStream provisions a JetStream stream and blocks until it is
+// publishable (leader elected), or ctx is done.
 //
-// Same multi-process-safe semantics as EnsureKV: server-side
-// meta-leader serialization by stream name, transient retry, insufficient-
-// peers fallback to single replica, post-ready opportunistic promotion via
-// EnsureReplicaScale.
+// Lookup-first: every iteration calls js.Stream to find an existing stream
+// before falling through to CreateOrUpdateStream. When the stream already
+// exists with an elected leader, the call returns without issuing an
+// update. This avoids forcing the server to re-validate (and on Replicas
+// drift, re-scale) the stream on every retry — a CreateOrUpdate-each-
+// iteration loop can stall for the full ctx budget against streams whose
+// scale-up to the requested replica count is gated by slow peer catch-up.
+//
+// Multi-process safe semantics:
+//
+//   - When the stream is missing, server-side meta-leader serialization by
+//     name guarantees that concurrent CreateOrUpdate callers either match
+//     (idempotent) or surface "stream already exists" / transient retry,
+//     both of which loop back to the next lookup.
+//   - "Insufficient peers" demotes cfg.Replicas to 1 and retries; post-
+//     ready opportunistic promotion via EnsureReplicaScale upgrades the
+//     stream when the cluster grows. Disable via WithoutReplicaFallback().
+//
+// Config drift on an existing stream is intentionally NOT reconciled here.
+// Callers needing drift reconciliation should call js.UpdateStream
+// explicitly outside this helper.
 //
 // Returns the resolved Stream handle.
 func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.StreamConfig, opts ...EnsureOption) (jetstream.Stream, error) {
@@ -185,13 +224,27 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 			return nil, err
 		}
 
-		stream, err := js.CreateOrUpdateStream(ctx, cfg)
+		// Lookup-first fast path.
+		if existing, err := js.Stream(ctx, cfg.Name); err == nil {
+			if isStreamPublishable(ctx, existing) {
+				ensureReplicaScale(ctx, js, cfg.Name, desiredReplicas, o)
+				return existing, nil
+			}
+			// Exists, leader still settling — wait for Raft instead of
+			// re-issuing CreateOrUpdate.
+			if err := sleepBackoff(ctx, &backoff, o.maxBackoff); err != nil {
+				return nil, err
+			}
+			continue
+		} else if !errors.Is(err, jetstream.ErrStreamNotFound) && !isTransientJetStreamError(err) {
+			return nil, fmt.Errorf("lookup stream %s: %w", cfg.Name, err)
+		}
+
+		_, err := js.CreateOrUpdateStream(ctx, cfg)
 		switch {
 		case err == nil:
-			if isStreamReady(ctx, stream) {
-				ensureReplicaScale(ctx, js, cfg.Name, desiredReplicas, o)
-				return stream, nil
-			}
+			// Loop back so the next iteration's lookup-first path picks up
+			// the handle and runs the publishable check.
 
 		case isInsufficientPeers(err) && o.fallbackOnInsufficientPeers && cfg.Replicas > EnsureFallbackReplicas:
 			logEvent(o.logger, "convergent: stream create rejected at default replica count, falling back to single replica",
@@ -308,11 +361,12 @@ func ensureReplicaScale(ctx context.Context, js jetstream.JetStream, streamName 
 		zap.Int("to", desired))
 }
 
-// isStreamReady reports whether a JetStream stream can accept publishes
-// right now. For a clustered stream this means an elected leader and all
-// replica peers caught up and online. For a non-clustered (single-node)
-// stream a non-nil StreamInfo is sufficient.
-func isStreamReady(ctx context.Context, stream jetstream.Stream) bool {
+// isStreamPublishable reports whether a JetStream stream can accept
+// publishes right now: leader elected is sufficient, regardless of whether
+// non-leader replicas are still catching up. Used by the lookup-first fast
+// path so cold-start doesn't stall on slow peer catch-up — the leader
+// alone can serve publishes while replicas converge in the background.
+func isStreamPublishable(ctx context.Context, stream jetstream.Stream) bool {
 	if stream == nil {
 		return false
 	}
@@ -323,25 +377,18 @@ func isStreamReady(ctx context.Context, stream jetstream.Stream) bool {
 	if info.Cluster == nil {
 		return true
 	}
-	if info.Cluster.Leader == "" {
-		return false
-	}
-	for _, r := range info.Cluster.Replicas {
-		if r == nil || r.Offline || !r.Current {
-			return false
-		}
-	}
-	return true
+	return info.Cluster.Leader != ""
 }
 
-// isJetStreamKVReady verifies the KV_<bucket> stream that backs a KV
-// bucket is publishable.
-func isJetStreamKVReady(ctx context.Context, js jetstream.JetStream, bucket string) bool {
+// isJetStreamKVPublishable reports whether the KV_<bucket> stream that
+// backs a KV bucket has an elected leader (i.e., the bucket is writable
+// now). Mirrors isStreamPublishable for the KV lookup-first fast path.
+func isJetStreamKVPublishable(ctx context.Context, js jetstream.JetStream, bucket string) bool {
 	stream, err := js.Stream(ctx, "KV_"+bucket)
 	if err != nil {
 		return false
 	}
-	return isStreamReady(ctx, stream)
+	return isStreamPublishable(ctx, stream)
 }
 
 // isAlreadyInUse reports whether err indicates a concurrent peer has
