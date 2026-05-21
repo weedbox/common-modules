@@ -228,6 +228,52 @@ func (c *NATSConnector) GetJetStreamContext() nats.JetStreamContext {
 	return c.js
 }
 
+// GetJetStream returns the modern jetstream.JetStream handle (nats.go new
+// API). Prefer this for new code that uses jetstream.KeyValueConfig /
+// jetstream.StreamConfig / jetstream.ConsumerConfig. The legacy
+// GetJetStreamContext() above is kept for backward compatibility.
+func (c *NATSConnector) GetJetStream() jetstream.JetStream {
+	return c.jsv2
+}
+
+// EnsureKV provisions a JetStream KV bucket safely across multiple
+// instances. Method form of the package-level EnsureKV; supplies the
+// connector's JetStream handle and logger.
+func (c *NATSConnector) EnsureKV(ctx context.Context, cfg jetstream.KeyValueConfig) (jetstream.KeyValue, error) {
+	if c.jsv2 == nil {
+		return nil, fmt.Errorf("nats jetstream not initialized")
+	}
+	return EnsureKV(ctx, c.jsv2, cfg, WithEnsureLogger(c.logger))
+}
+
+// EnsureStream provisions a JetStream stream safely across multiple
+// instances. Method form of the package-level EnsureStream.
+func (c *NATSConnector) EnsureStream(ctx context.Context, cfg jetstream.StreamConfig) (jetstream.Stream, error) {
+	if c.jsv2 == nil {
+		return nil, fmt.Errorf("nats jetstream not initialized")
+	}
+	return EnsureStream(ctx, c.jsv2, cfg, WithEnsureLogger(c.logger))
+}
+
+// EnsureConsumer provisions a durable consumer on the given stream safely
+// across multiple instances. Method form of the package-level EnsureConsumer.
+func (c *NATSConnector) EnsureConsumer(ctx context.Context, stream jetstream.Stream, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error) {
+	if c.jsv2 == nil {
+		return nil, fmt.Errorf("nats jetstream not initialized")
+	}
+	return EnsureConsumer(ctx, stream, cfg, WithEnsureLogger(c.logger))
+}
+
+// EnsureReplicaScale opportunistically promotes an existing stream toward
+// `desired` replicas. Best-effort; never returns an error. See
+// EnsureReplicaScale (package-level) for details.
+func (c *NATSConnector) EnsureReplicaScale(ctx context.Context, streamName string, desired int) {
+	if c.jsv2 == nil {
+		return
+	}
+	EnsureReplicaScale(ctx, c.jsv2, streamName, desired, WithEnsureLogger(c.logger))
+}
+
 // NewLock creates a distributed lock backed by the NATS JetStream KV bucket
 // configured via {scope}.lock.bucket. Multiple Lock instances with the same
 // Key are mutually exclusive across all NATS clients connected to the same

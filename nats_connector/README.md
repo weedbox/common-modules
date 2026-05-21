@@ -329,9 +329,76 @@ downstream readers cannot reconstruct the batch boundary. If your
 consumers need that, carry your own correlation header (e.g.
 `X-Tx-Id`).
 
+### Multi-Instance-Safe Resource Provisioning
+
+When several replicas boot at the same time and each tries to create the same JetStream stream / KV bucket / durable consumer, naive `CreateStream` races can produce `"no responders"` errors, leadership-transferred errors, or "already in use" errors. The connector exposes a family of **convergent ensure** helpers that wrap JetStream's `CreateOrUpdate*` API with classification of transient vs terminal errors, bounded exponential backoff, and single-node replica fallback. They rely on JetStream meta-leader to serialize `CreateOrUpdate*` by name across the cluster — no distributed lock required.
+
+Use these whenever you need to declaratively provision a stream / bucket / consumer at start-up and don't want each replica to fight over it.
+
+```go
+// Method form: most common — uses the connector's JetStream handle + logger.
+stream, err := nc.EnsureStream(ctx, jetstream.StreamConfig{
+    Name:     "EVENTS",
+    Subjects: []string{"events.>"},
+    Replicas: 3, // auto-falls back to 1 on single-node servers
+})
+if err != nil { return err }
+
+kv, err := nc.EnsureKV(ctx, jetstream.KeyValueConfig{
+    Bucket:   "user-sessions",
+    History:  5,
+    Replicas: 3,
+})
+if err != nil { return err }
+
+consumer, err := nc.EnsureConsumer(ctx, stream, jetstream.ConsumerConfig{
+    Durable:       "worker-A",
+    FilterSubject: "events.>",
+    AckPolicy:     jetstream.AckExplicitPolicy,
+})
+if err != nil { return err }
+
+// Opportunistic scale-up: best-effort, never returns an error.
+// Useful when an older deployment created the stream as replicas=1 and
+// a new cluster topology now supports replicas=3.
+nc.EnsureReplicaScale(ctx, "EVENTS", 3)
+```
+
+```go
+// Stand-alone form: caller supplies the JetStream handle. Useful when
+// you need to provision against a different JetStream account, or in
+// code paths that already have a jetstream.JetStream value.
+js := nc.GetJetStream()
+stream, err := nats_connector.EnsureStream(ctx, js, cfg,
+    nats_connector.WithEnsureLogger(logger),
+    nats_connector.WithEnsureBackoff(200*time.Millisecond, 2*time.Second),
+)
+```
+
+**Semantics:**
+
+- **Idempotency via `CreateOrUpdate`** — every helper calls `js.CreateOrUpdateKeyValue` / `js.CreateOrUpdateStream` / `stream.CreateOrUpdateConsumer`. The JetStream meta-leader serializes these by resource name, so concurrent callers across all replicas converge on the same final config without races.
+- **Transient error retry** — `"no responders"`, leadership-transferred, "stream in use", and timeout errors are classified as transient and retried with exponential backoff (default 200ms → 2s, capped per attempt). Non-transient errors (e.g. subjects overlap, conflicting config) are surfaced immediately.
+- **Replica fallback** — when the server replies `err_code 10074` (insufficient peers), the helper retries once with `Replicas=1`, logs a warning, and returns the single-node resource. This keeps single-node dev environments working with the same `Replicas=3` config used in production. Disable via `WithoutReplicaFallback()` to get a hard error instead.
+- **`EnsureReplicaScale`** — best-effort. Reads current stream info, returns early if `desired ≤ 1` or current replicas already meet `desired`. Calls `UpdateStream` to promote replicas; logs and swallows any error. Use this when a topology change should make an existing stream more durable.
+- **Logger** — pass a `*zap.Logger` via `WithEnsureLogger(l)`. The method form auto-supplies the connector's logger. Nil logger is safe (logs are skipped).
+- **No state at this layer** — these helpers do not touch viper or any shared state. Backoff and replica behaviour are controlled per call via options.
+
+**When to use `Ensure*` vs `Once`:**
+
+| Need | Use |
+|------|-----|
+| Provision the same stream / KV / consumer from every replica | `Ensure*` |
+| Run an arbitrary `func(ctx) error` body exactly once across all replicas (e.g. schema migration, seed data) | `Once` |
+| Acquire mutual exclusion around a critical section | `NewLock` |
+
+For new code that only needs to declare JetStream resources, prefer `Ensure*` — it requires no distributed lock, no bucket bootstrapping for the lock itself, and tolerates replicas racing to start up.
+
 ### Distributed Lock & Once
 
-Across multiple instances of the same service, the connector exposes a NATS JetStream-backed distributed lock and a `Once` helper for cross-instance "init exactly once" patterns. Typical use cases: schema migrations, stream/bucket bootstrapping, seed data, registering one-time external resources.
+Across multiple instances of the same service, the connector exposes a NATS JetStream-backed distributed lock and a `Once` helper for cross-instance "init exactly once" patterns. Typical use cases: schema migrations, seed data, registering one-time external resources.
+
+> For declaratively provisioning streams, KV buckets, or durable consumers, prefer the `Ensure*` helpers above — they're cheaper (no lock bucket bootstrap), simpler (one call per resource), and rely on JetStream's built-in name-level serialization instead of a CAS lock.
 
 ```go
 // Low-level mutex: blocks until acquired or ctx is cancelled.
@@ -444,7 +511,27 @@ Returns the NATS connection instance.
 
 #### `GetJetStreamContext() nats.JetStreamContext`
 
-Returns the JetStream context for stream operations.
+Returns the legacy JetStream context for stream operations. Kept for backward compatibility; prefer `GetJetStream()` for new code.
+
+#### `GetJetStream() jetstream.JetStream`
+
+Returns the modern `jetstream.JetStream` handle (new nats.go API). Use this when working with `jetstream.KeyValueConfig` / `jetstream.StreamConfig` / `jetstream.ConsumerConfig`, or when calling the package-level `Ensure*` functions directly.
+
+#### `EnsureKV(ctx context.Context, cfg jetstream.KeyValueConfig) (jetstream.KeyValue, error)`
+
+Provisions a JetStream KV bucket safely across multiple instances. Method form of the package-level `EnsureKV`; supplies the connector's JetStream handle and logger. See **Multi-Instance-Safe Resource Provisioning** above.
+
+#### `EnsureStream(ctx context.Context, cfg jetstream.StreamConfig) (jetstream.Stream, error)`
+
+Provisions a JetStream stream safely across multiple instances. Method form of the package-level `EnsureStream`.
+
+#### `EnsureConsumer(ctx context.Context, stream jetstream.Stream, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error)`
+
+Provisions a durable consumer on the given stream safely across multiple instances. Method form of the package-level `EnsureConsumer`.
+
+#### `EnsureReplicaScale(ctx context.Context, streamName string, desired int)`
+
+Best-effort opportunistic promotion of an existing stream toward `desired` replicas. Never returns an error; logs and swallows failures. No-op when `desired ≤ 1` or current replicas already meet `desired`.
 
 #### `NewWorkQueueConsumer(streamName string, cfg WorkQueueConfig) (*WorkQueueConsumer, error)`
 
@@ -468,6 +555,38 @@ Creates a distributed lock backed by JetStream KV. See **Distributed Lock & Once
 #### `Once(ctx context.Context, key string, fn func(context.Context) error) error`
 
 Runs `fn` exactly once across all instances. See **Distributed Lock & Once** above.
+
+### Package-level Ensure Functions
+
+For callers that already have a `jetstream.JetStream` handle (e.g. wiring a different account, embedding in another module), the convergent helpers are also exposed as package-level functions. Each has the same name as its `*NATSConnector` method form; the package-level form takes an explicit `jetstream.JetStream` handle and `...EnsureOption`.
+
+#### `EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValueConfig, opts ...EnsureOption) (jetstream.KeyValue, error)`
+
+Stand-alone form of `(*NATSConnector).EnsureKV`.
+
+#### `EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.StreamConfig, opts ...EnsureOption) (jetstream.Stream, error)`
+
+Stand-alone form of `(*NATSConnector).EnsureStream`.
+
+#### `EnsureConsumer(ctx context.Context, stream jetstream.Stream, cfg jetstream.ConsumerConfig, opts ...EnsureOption) (jetstream.Consumer, error)`
+
+Stand-alone form of `(*NATSConnector).EnsureConsumer`.
+
+#### `EnsureReplicaScale(ctx context.Context, js jetstream.JetStream, streamName string, desired int, opts ...EnsureOption)`
+
+Stand-alone form of `(*NATSConnector).EnsureReplicaScale`. Best-effort; never returns an error.
+
+#### `WithEnsureLogger(l *zap.Logger) EnsureOption`
+
+Installs a zap logger that receives structured-log lines on non-trivial transitions (insufficient-peers fallback, replica scale-up result, final scale-up failure). `nil` is allowed and silences the logger.
+
+#### `WithEnsureBackoff(base, max time.Duration) EnsureOption`
+
+Overrides the retry backoff window. `base` is the initial sleep between retries; `max` caps the doubled value. Defaults are 200ms and 2s.
+
+#### `WithoutReplicaFallback() EnsureOption`
+
+Disables the silent demotion to `Replicas=1` when the cluster reports insufficient peers; surfaces the placement error instead.
 
 ### WorkQueueConsumer
 
