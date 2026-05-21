@@ -42,12 +42,10 @@ execBucket    = "SCHEDULER_EXECUTIONS"
 # reconcilerInterval       = "30s"   # background republish reconciler
 # reconcilerGracePeriod    = "30s"   # lag tolerated before a job is treated as stuck
 # addJobRetryBudget        = "5s"    # AddJob/Update retry budget across raft hiccups
-# startupStreamReadyTimeout = "30s"  # wait for SCHEDULER stream raft leader
 # jetStreamReadyTimeout    = "30s"   # wait for JetStream metaleader
 # startPhaseTimeout        = "30s"   # per-phase cap inside Start()
 # loadJobsConcurrency      = 32      # worker pool size for parallel KV reads at startup
 # loadJobsAsyncPublishTimeout = "30s" # cap for draining startup async publishes
-# onceKey                  = "scheduler.init"  # key used on the shared nats_connector lock bucket
 # [scheduler.nats.publishRetry]
 # attempts        = 3
 # initialBackoff  = "1s"
@@ -56,10 +54,9 @@ execBucket    = "SCHEDULER_EXECUTIONS"
 In `gorm` mode the module also needs a
 [`database.DatabaseConnector`](../database/) to be provided (e.g.
 `sqlite_connector` or `postgres_connector`). In `nats` mode it needs
-[`nats_connector`](../nats_connector/); the scheduler reuses the connector's
-distributed-once primitive (`NATSConnector.Once`) so first-deploy
-provisioning serializes through the same lock substrate as every other
-module.
+[`nats_connector`](../nats_connector/); first-deploy provisioning of the
+stream, KV buckets, and durable consumer is handled internally by the
+upstream library's convergent-ensure primitives.
 
 ## Quick Start
 
@@ -136,12 +133,12 @@ splitting on the same code path.
 
 **Multi-instance deployments.** Multiple scheduler replicas can run against
 the same stream concurrently. First-deploy provisioning of the stream, KV
-buckets, and durable consumer is serialized through a distributed-once
-primitive (sourced from `nats_connector`), and the durable consumer's
-work-queue semantics ensure each trigger is delivered to exactly one
-replica. Recurring chains survive replica crashes, leader re-elections,
-and rolling restarts; a background reconciler republishes any job whose
-next-run has slipped past its grace window.
+buckets, and durable consumer converges through the upstream library's
+ensure helpers, and the durable consumer's work-queue semantics ensure
+each trigger is delivered to exactly one replica. Recurring chains survive
+replica crashes, leader re-elections, and rolling restarts; a background
+reconciler republishes any job whose next-run has slipped past its grace
+window.
 
 ## API
 
@@ -242,8 +239,8 @@ Schedule constructors live in the underlying library; import
   triggers and a healthy peer is not disrupted.
 - **`nats` mode supports multi-instance deployments.** Replicas share the
   same durable consumer; each scheduled message is delivered to exactly
-  one replica. First-deploy provisioning is serialized through
-  `nats_connector.Once`. The scheduler's background reconciler republishes
-  any recurring job whose next-run has slipped past
+  one replica. First-deploy provisioning converges through the upstream
+  library's ensure helpers. The scheduler's background reconciler
+  republishes any recurring job whose next-run has slipped past
   `nats.reconcilerGracePeriod` to recover from publish failures or
   unclean shutdowns.

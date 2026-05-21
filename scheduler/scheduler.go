@@ -128,7 +128,6 @@ func (m *SchedulerModule) natsOptionsFromConfig() []libsched.NATSSchedulerOption
 		{"nats.reconcilerInterval", libsched.WithReconcilerInterval},
 		{"nats.reconcilerGracePeriod", libsched.WithReconcilerGracePeriod},
 		{"nats.addJobRetryBudget", libsched.WithAddJobRetryBudget},
-		{"nats.startupStreamReadyTimeout", libsched.WithStartupStreamReadyTimeout},
 		{"nats.jetStreamReadyTimeout", libsched.WithJetStreamReadyTimeout},
 		{"nats.startPhaseTimeout", libsched.WithStartPhaseTimeout},
 		{"nats.loadJobsAsyncPublishTimeout", libsched.WithLoadJobsAsyncPublishTimeout},
@@ -152,15 +151,6 @@ func (m *SchedulerModule) natsOptionsFromConfig() []libsched.NATSSchedulerOption
 		attempts := viper.GetInt(m.getConfigPath("nats.publishRetry.attempts"))
 		backoff := viper.GetDuration(m.getConfigPath("nats.publishRetry.initialBackoff"))
 		opts = append(opts, libsched.WithPublishRetry(attempts, backoff))
-	}
-
-	// WithOnceKey controls the key under which first-deploy provisioning
-	// serializes on the shared nats_connector lock bucket. WithOnceLockBucket
-	// is intentionally not exposed here: the bucket is owned by
-	// nats_connector and configured via its own `lock.bucket` key, not via
-	// the scheduler module.
-	if v := viper.GetString(m.getConfigPath("nats.onceKey")); v != "" {
-		opts = append(opts, libsched.WithOnceKey(v))
 	}
 
 	return opts
@@ -194,10 +184,6 @@ func (m *SchedulerModule) onStart(ctx context.Context) error {
 			libsched.WithNATSSchedulerExecBucket(viper.GetString(m.getConfigPath("nats.execBucket"))),
 			libsched.WithNATSSchedulerCodec(m.codec),
 			libsched.WithNATSSchedulerLogger(zapNATSLogger(m.logger)),
-			// Share the distributed-once primitive with the rest of
-			// common-modules so first-deploy provisioning across all
-			// modules serializes through a single lock substrate.
-			libsched.WithOnce(m.nats.Once),
 		}
 		opts = append(opts, m.natsOptionsFromConfig()...)
 		sched = libsched.NewNATSScheduler(js, m.dispatch, opts...)

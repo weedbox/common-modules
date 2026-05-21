@@ -4,8 +4,8 @@ github.com/PuerkitoBio/purell v1.1.1 h1:WEQqlqaGbrPkxLJWfBwQmfEAE1Z7ONdDLqrN38tN
 github.com/PuerkitoBio/purell v1.1.1/go.mod h1:c11w/QuzBsJSee3cPx9rAFu61PvFxuPbtSwDGJws/X0=
 github.com/PuerkitoBio/urlesc v0.0.0-20170810143723-de5bf2ad4578 h1:d+Bc7a5rLufV/sSk/8dngufqelfh6jnri85riMAaF/M=
 github.com/PuerkitoBio/urlesc v0.0.0-20170810143723-de5bf2ad4578/go.mod h1:uGdkoq3SwY9Y+13GIhn11/XLaGBb4BfwItxLd5jeuXE=
-github.com/Weedbox/scheduler v0.3.1 h1:UjCP1VfKVjrZY6X8nOQl2JAnGwPIVzJaZKxST4Waf8s=
-github.com/Weedbox/scheduler v0.3.1/go.mod h1:jQaPF3InbONAGZBK3PTddzhcCoRJm6rPIjfvytcI9AU=
+github.com/Weedbox/scheduler v0.4.0 h1:vK4gNueVj7FMm2d5yRo7/pXwi/yn/l8l0jnQhRPfF98=
+github.com/Weedbox/scheduler v0.4.0/go.mod h1:jQaPF3InbONAGZBK3PTddzhcCoRJm6rPIjfvytcI9AU=
 github.com/antithesishq/antithesis-sdk-go v0.7.0-default-no-op h1:Z/MZK75wC/NSrkgqeNIa7jexam9uWzhLmFTSCPI/kn0=
 github.com/antithesishq/antithesis-sdk-go v0.7.0-default-no-op/go.mod h1:FQyySiasQQM8735Ddel3MRojmy4dA1IqCeyJ5jmPMbI=
 github.com/bytedance/sonic v1.14.0 h1:/OfKt8HFw0kh2rj8N0F6C/qPGRESq0BbaNZgcNXXzQQ=
