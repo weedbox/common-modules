@@ -58,7 +58,10 @@ func TestEnsureKV_BasicCreate(t *testing.T) {
 	r := newRig(t)
 	ctx := context.Background()
 
-	cfg := jetstream.KeyValueConfig{Bucket: "ensure_basic"}
+	// Replicas=1 avoids the insufficient-peers fallback path entirely on
+	// the single-node embedded server; this test is about basic create
+	// semantics, not replica-fallback behaviour.
+	cfg := jetstream.KeyValueConfig{Bucket: "ensure_basic", Replicas: 1}
 	kv, err := EnsureKV(ctx, r.js, cfg)
 	if err != nil {
 		t.Fatalf("EnsureKV: %v", err)
@@ -82,7 +85,7 @@ func TestEnsureKV_AlreadyExistsIsIdempotent(t *testing.T) {
 	r := newRig(t)
 	ctx := context.Background()
 
-	cfg := jetstream.KeyValueConfig{Bucket: "ensure_idempotent"}
+	cfg := jetstream.KeyValueConfig{Bucket: "ensure_idempotent", Replicas: 1}
 
 	kv1, err := EnsureKV(ctx, r.js, cfg)
 	if err != nil {
@@ -104,7 +107,7 @@ func TestEnsureKV_ConcurrentEnsureSameBucket(t *testing.T) {
 	warmJetStream(t, r, ctx)
 
 	const N = 8
-	cfg := jetstream.KeyValueConfig{Bucket: "ensure_concurrent_kv"}
+	cfg := jetstream.KeyValueConfig{Bucket: "ensure_concurrent_kv", Replicas: 1}
 
 	var wg sync.WaitGroup
 	errs := make([]error, N)
@@ -154,7 +157,7 @@ func TestEnsureKV_ReplicaFallbackOnSingleNode(t *testing.T) {
 	// is "no error returned and KV is usable". TestEnsureOptions_
 	// LoggerCapturesFallback covers the demote-to-1 codepath specifically.
 	cfg := jetstream.KeyValueConfig{Bucket: "ensure_fallback_kv", Replicas: 3}
-	kv, err := EnsureKV(ctx, r.js, cfg)
+	kv, err := EnsureKV(ctx, r.js, cfg, WithInsufficientPeersBudget(0))
 	if err != nil {
 		t.Fatalf("EnsureKV with Replicas=3 on single node: %v", err)
 	}
@@ -208,7 +211,7 @@ func TestEnsureKV_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	_, err := EnsureKV(ctx, r.js, jetstream.KeyValueConfig{Bucket: "ensure_ctx_cancel"})
+	_, err := EnsureKV(ctx, r.js, jetstream.KeyValueConfig{Bucket: "ensure_ctx_cancel", Replicas: 1})
 	if err == nil {
 		t.Fatalf("expected ctx error after server shutdown")
 	}
@@ -226,6 +229,7 @@ func TestEnsureStream_BasicCreate(t *testing.T) {
 	cfg := jetstream.StreamConfig{
 		Name:     "ENSURE_BASIC",
 		Subjects: []string{"ensure.basic.>"},
+		Replicas: 1,
 	}
 	stream, err := EnsureStream(ctx, r.js, cfg)
 	if err != nil {
@@ -250,6 +254,7 @@ func TestEnsureStream_ConcurrentEnsureSameStream(t *testing.T) {
 	cfg := jetstream.StreamConfig{
 		Name:     "ENSURE_CONCURRENT",
 		Subjects: []string{"ensure.concurrent.>"},
+		Replicas: 1,
 	}
 
 	var wg sync.WaitGroup
@@ -291,6 +296,7 @@ func TestEnsureStream_ConflictingSubjectsSurfacesError(t *testing.T) {
 	if _, err := EnsureStream(ctx, r.js, jetstream.StreamConfig{
 		Name:     "ENSURE_OWNER",
 		Subjects: []string{"a.>"},
+		Replicas: 1,
 	}); err != nil {
 		t.Fatalf("seed stream: %v", err)
 	}
@@ -304,6 +310,7 @@ func TestEnsureStream_ConflictingSubjectsSurfacesError(t *testing.T) {
 	_, err := EnsureStream(ctx2, r.js, jetstream.StreamConfig{
 		Name:     "ENSURE_INTRUDER",
 		Subjects: []string{"a.>"},
+		Replicas: 1,
 	})
 	if err == nil {
 		t.Fatalf("expected subjects-overlap error, got nil")
@@ -325,7 +332,7 @@ func TestEnsureStream_ReplicaFallbackOnSingleNode(t *testing.T) {
 		Subjects: []string{"ensure.replicas.>"},
 		Replicas: 3,
 	}
-	stream, err := EnsureStream(ctx, r.js, cfg)
+	stream, err := EnsureStream(ctx, r.js, cfg, WithInsufficientPeersBudget(0))
 	if err != nil {
 		t.Fatalf("EnsureStream: %v", err)
 	}
@@ -355,6 +362,7 @@ func TestEnsureConsumer_BasicCreate(t *testing.T) {
 	stream, err := EnsureStream(ctx, r.js, jetstream.StreamConfig{
 		Name:     "ENSURE_CONSUMER",
 		Subjects: []string{"ensure.consumer.>"},
+		Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("EnsureStream: %v", err)
@@ -392,6 +400,7 @@ func TestEnsureConsumer_ConcurrentSameDurable(t *testing.T) {
 	stream, err := EnsureStream(ctx, r.js, jetstream.StreamConfig{
 		Name:     "ENSURE_CONSUMER_CONCURRENT",
 		Subjects: []string{"ensure.cc.>"},
+		Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("EnsureStream: %v", err)
@@ -445,13 +454,25 @@ func TestEnsureReplicaScale_NoopOnDesiredLEOne(t *testing.T) {
 	EnsureReplicaScale(ctx, r.js, "NONEXISTENT_STREAM", 0)
 }
 
-func TestEnsureReplicaScale_NoopWhenSingleNode(t *testing.T) {
+func TestEnsureReplicaScale_NoopOnMissingStream(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	// EnsureReplicaScale must not panic / return on a non-existent stream:
+	// the internal js.Stream lookup error is swallowed (best-effort
+	// promotion). This exercises the "stream lookup failed" branch of the
+	// noop guards.
+	EnsureReplicaScale(ctx, r.js, "DOES_NOT_EXIST", 3)
+}
+
+func TestEnsureReplicaScale_NoopOnCurrentGEDesired(t *testing.T) {
 	r := newRig(t)
 	ctx := context.Background()
 
 	stream, err := EnsureStream(ctx, r.js, jetstream.StreamConfig{
 		Name:     "ENSURE_SCALE_NOOP",
 		Subjects: []string{"ensure.scale.noop.>"},
+		Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("EnsureStream: %v", err)
@@ -461,10 +482,10 @@ func TestEnsureReplicaScale_NoopWhenSingleNode(t *testing.T) {
 		t.Fatalf("Info: %v", err)
 	}
 
-	// Single-node embedded server: info.Cluster is nil, scale-up should
-	// be a no-op (no panic, no error returned because EnsureReplicaScale
-	// has no return value).
-	EnsureReplicaScale(ctx, r.js, "ENSURE_SCALE_NOOP", 3)
+	// current >= desired short-circuit: requesting desired=1 against an
+	// R=1 stream hits the early `desired <= 1` guard, so no UpdateStream
+	// is issued.
+	EnsureReplicaScale(ctx, r.js, "ENSURE_SCALE_NOOP", 1)
 
 	infoAfter, err := stream.Info(ctx)
 	if err != nil {
@@ -491,7 +512,7 @@ func TestNATSConnector_EnsureKVMethod(t *testing.T) {
 	c := connectorOnRig(r)
 	ctx := context.Background()
 
-	kv, err := c.EnsureKV(ctx, jetstream.KeyValueConfig{Bucket: "method_kv"})
+	kv, err := c.EnsureKV(ctx, jetstream.KeyValueConfig{Bucket: "method_kv", Replicas: 1})
 	if err != nil {
 		t.Fatalf("EnsureKV: %v", err)
 	}
@@ -508,6 +529,7 @@ func TestNATSConnector_EnsureStreamMethod(t *testing.T) {
 	stream, err := c.EnsureStream(ctx, jetstream.StreamConfig{
 		Name:     "METHOD_STREAM",
 		Subjects: []string{"method.>"},
+		Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("EnsureStream: %v", err)
@@ -525,6 +547,7 @@ func TestNATSConnector_EnsureConsumerMethod(t *testing.T) {
 	stream, err := c.EnsureStream(ctx, jetstream.StreamConfig{
 		Name:     "METHOD_STREAM_CONSUMER",
 		Subjects: []string{"method.consumer.>"},
+		Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("EnsureStream: %v", err)
@@ -550,13 +573,14 @@ func TestNATSConnector_EnsureReplicaScaleMethod(t *testing.T) {
 	if _, err := c.EnsureStream(ctx, jetstream.StreamConfig{
 		Name:     "METHOD_STREAM_SCALE",
 		Subjects: []string{"method.scale.>"},
+		Replicas: 1,
 	}); err != nil {
 		t.Fatalf("EnsureStream: %v", err)
 	}
-	// Just confirms no panic on single-node server. desired<=1 fast path.
+	// Confirms no panic on the method form, exercising both early-return
+	// guards: desired<=1 fast path, and lookup on a non-existent stream.
 	c.EnsureReplicaScale(ctx, "METHOD_STREAM_SCALE", 1)
-	// And desired>1 against single-node (no Cluster info) → silent no-op.
-	c.EnsureReplicaScale(ctx, "METHOD_STREAM_SCALE", 3)
+	c.EnsureReplicaScale(ctx, "METHOD_DOES_NOT_EXIST", 3)
 }
 
 // --- options coverage --------------------------------------------------------
@@ -571,7 +595,7 @@ func TestEnsureOptions_LoggerCapturesFallback(t *testing.T) {
 	_, err := EnsureKV(ctx, r.js, jetstream.KeyValueConfig{
 		Bucket:   "ensure_observed",
 		Replicas: 3,
-	}, WithEnsureLogger(logger))
+	}, WithEnsureLogger(logger), WithInsufficientPeersBudget(0))
 	if err != nil {
 		t.Fatalf("EnsureKV: %v", err)
 	}
@@ -589,9 +613,44 @@ func TestEnsureOptions_BackoffOverrideDoesNotPanic(t *testing.T) {
 	r := newRig(t)
 	ctx := context.Background()
 
-	_, err := EnsureKV(ctx, r.js, jetstream.KeyValueConfig{Bucket: "ensure_backoff_opt"},
+	_, err := EnsureKV(ctx, r.js, jetstream.KeyValueConfig{Bucket: "ensure_backoff_opt", Replicas: 1},
 		WithEnsureBackoff(50*time.Millisecond, 500*time.Millisecond))
 	if err != nil {
 		t.Fatalf("EnsureKV with custom backoff: %v", err)
+	}
+}
+
+// TestEnsureKV_InsufficientPeersBudgetDelaysFallback exercises the budget
+// path: the embedded single-node server returns "insufficient peers" for
+// Replicas=3, so the helper should retry at the requested replica count
+// for at least the configured budget before logging the fallback. Verifies
+// that (a) the budget is honored as a lower bound, and (b) the fallback
+// still eventually fires so the call doesn't deadlock single-node deploys.
+func TestEnsureKV_InsufficientPeersBudgetDelaysFallback(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	core, logs := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
+
+	const budget = 600 * time.Millisecond
+	start := time.Now()
+	_, err := EnsureKV(ctx, r.js, jetstream.KeyValueConfig{
+		Bucket:   "ensure_budget_kv",
+		Replicas: 3,
+	}, WithEnsureLogger(logger), WithInsufficientPeersBudget(budget))
+	if err != nil {
+		t.Fatalf("EnsureKV: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if logs.FilterMessageSnippet("within bootstrap budget").Len() == 0 {
+		t.Fatalf("expected at least one 'within bootstrap budget' log, got none")
+	}
+	if logs.FilterMessageSnippet("falling back to single replica").Len() == 0 {
+		t.Fatalf("expected fallback log after budget elapsed, got none")
+	}
+	if elapsed < budget {
+		t.Fatalf("expected total elapsed >= budget %v, got %v — fallback fired too early", budget, elapsed)
 	}
 }

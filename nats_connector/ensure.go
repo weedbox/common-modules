@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )
@@ -28,6 +29,14 @@ const (
 	EnsureFallbackReplicas   = 1
 	DefaultEnsureBaseBackoff = 200 * time.Millisecond
 	DefaultEnsureMaxBackoff  = 2 * time.Second
+	// DefaultInsufficientPeersBudget is the window during which an
+	// "insufficient peers" error is treated as a cluster-bootstrap
+	// transient (per-stream Raft / peer discovery still settling) and
+	// retried at the requested replica count, before falling back to a
+	// single replica. Sized to comfortably cover NATS meta-leader
+	// election + per-stream Raft group formation on a 3-node cluster
+	// cold-start, while bounding single-node-deployment startup latency.
+	DefaultInsufficientPeersBudget = 30 * time.Second
 )
 
 // EnsureOption configures the convergent Ensure* helpers.
@@ -38,6 +47,7 @@ type ensureOptions struct {
 	baseBackoff                 time.Duration
 	maxBackoff                  time.Duration
 	fallbackOnInsufficientPeers bool
+	insufficientPeersBudget     time.Duration
 }
 
 func resolveEnsureOptions(opts []EnsureOption) ensureOptions {
@@ -45,6 +55,7 @@ func resolveEnsureOptions(opts []EnsureOption) ensureOptions {
 		baseBackoff:                 DefaultEnsureBaseBackoff,
 		maxBackoff:                  DefaultEnsureMaxBackoff,
 		fallbackOnInsufficientPeers: true,
+		insufficientPeersBudget:     DefaultInsufficientPeersBudget,
 	}
 	for _, fn := range opts {
 		fn(&o)
@@ -54,6 +65,9 @@ func resolveEnsureOptions(opts []EnsureOption) ensureOptions {
 	}
 	if o.maxBackoff < o.baseBackoff {
 		o.maxBackoff = o.baseBackoff
+	}
+	if o.insufficientPeersBudget < 0 {
+		o.insufficientPeersBudget = 0
 	}
 	return o
 }
@@ -85,6 +99,20 @@ func WithoutReplicaFallback() EnsureOption {
 	return func(o *ensureOptions) { o.fallbackOnInsufficientPeers = false }
 }
 
+// WithInsufficientPeersBudget overrides how long the helper treats
+// "insufficient peers" as a transient cluster-bootstrap error (retrying
+// at the requested replica count) before falling back to a single
+// replica. Set to 0 to fall back immediately on the first occurrence —
+// useful for single-node deployments that should not pay the bootstrap-
+// budget wait, and for tests asserting the fallback path. Negative
+// values are clamped to 0. Default DefaultInsufficientPeersBudget.
+//
+// Has no effect when combined with WithoutReplicaFallback (which
+// disables fallback entirely).
+func WithInsufficientPeersBudget(d time.Duration) EnsureOption {
+	return func(o *ensureOptions) { o.insufficientPeersBudget = d }
+}
+
 // EnsureKV provisions a JetStream KV bucket and blocks until the
 // underlying KV_<bucket> stream is publishable, or ctx is done.
 //
@@ -104,11 +132,16 @@ func WithoutReplicaFallback() EnsureOption {
 //     "bucket already exists" — both fall back to the next lookup.
 //   - Transient cold-start errors (no responders, leader-flap, "no response
 //     from stream", etc.) are absorbed by the retry loop.
-//   - "Insufficient peers" demotes cfg.Replicas to 1 and retries. Once the
-//     bucket is publishable EnsureReplicaScale runs a best-effort promotion
-//     toward the original Replicas, which makes a cluster that later grows
-//     from 1-node to 3-node self-heal on the next call. Disable via
-//     WithoutReplicaFallback().
+//   - "Insufficient peers" is first treated as a cluster-bootstrap transient
+//     for InsufficientPeersBudget (default 30s) — the cluster's meta-leader
+//     election and per-stream Raft formation can momentarily report "no
+//     suitable peers" before peer discovery completes. Only after the
+//     budget elapses without recovery is cfg.Replicas demoted to 1. Once
+//     the bucket is publishable EnsureReplicaScale runs a best-effort
+//     promotion toward the original Replicas, which makes a cluster that
+//     later grows from 1-node to 3-node self-heal on the next call.
+//     Disable fallback entirely via WithoutReplicaFallback(), or shorten /
+//     zero the budget via WithInsufficientPeersBudget().
 //
 // Config drift on an existing bucket is intentionally NOT reconciled here:
 // the lookup-first short-circuits the CreateOrUpdate path when the bucket
@@ -131,6 +164,7 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 	}
 
 	backoff := o.baseBackoff
+	var insufficientPeersSince time.Time
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -138,7 +172,7 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 
 		// Lookup-first fast path.
 		if kv, err := js.KeyValue(ctx, cfg.Bucket); err == nil {
-			if isJetStreamKVPublishable(ctx, js, cfg.Bucket) {
+			if isJetStreamKVReady(ctx, js, cfg.Bucket) {
 				ensureReplicaScale(ctx, js, "KV_"+cfg.Bucket, desiredReplicas, o)
 				return kv, nil
 			}
@@ -159,11 +193,26 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 			// the handle and runs the publishable check.
 
 		case isInsufficientPeers(err) && o.fallbackOnInsufficientPeers && cfg.Replicas > EnsureFallbackReplicas:
-			logEvent(o.logger, "convergent: KV create rejected at default replica count, falling back to single replica",
-				zap.String("bucket", cfg.Bucket),
-				zap.Int("attempted_replicas", cfg.Replicas),
-				zap.Error(err))
-			cfg.Replicas = EnsureFallbackReplicas
+			firstSeen := insufficientPeersSince.IsZero()
+			if firstSeen {
+				insufficientPeersSince = time.Now()
+			}
+			if time.Since(insufficientPeersSince) < o.insufficientPeersBudget {
+				if firstSeen {
+					logEvent(o.logger, "convergent: KV insufficient peers within bootstrap budget, retrying at requested replicas",
+						zap.String("bucket", cfg.Bucket),
+						zap.Int("replicas", cfg.Replicas),
+						zap.Duration("budget", o.insufficientPeersBudget),
+						zap.Error(err))
+				}
+			} else {
+				logEvent(o.logger, "convergent: KV create rejected at default replica count, falling back to single replica",
+					zap.String("bucket", cfg.Bucket),
+					zap.Int("attempted_replicas", cfg.Replicas),
+					zap.Duration("budget_elapsed", time.Since(insufficientPeersSince)),
+					zap.Error(err))
+				cfg.Replicas = EnsureFallbackReplicas
+			}
 
 		case isAlreadyInUse(err) || isTransientJetStreamError(err):
 			// peer is mid-create or burst-induced transient — fall through
@@ -196,9 +245,13 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 //     name guarantees that concurrent CreateOrUpdate callers either match
 //     (idempotent) or surface "stream already exists" / transient retry,
 //     both of which loop back to the next lookup.
-//   - "Insufficient peers" demotes cfg.Replicas to 1 and retries; post-
-//     ready opportunistic promotion via EnsureReplicaScale upgrades the
-//     stream when the cluster grows. Disable via WithoutReplicaFallback().
+//   - "Insufficient peers" is first treated as a cluster-bootstrap transient
+//     for InsufficientPeersBudget (default 30s); only after the budget
+//     elapses without recovery is cfg.Replicas demoted to 1. Post-ready
+//     opportunistic promotion via EnsureReplicaScale upgrades the stream
+//     when the cluster later grows. Disable fallback entirely via
+//     WithoutReplicaFallback(), or shorten / zero the budget via
+//     WithInsufficientPeersBudget().
 //
 // Config drift on an existing stream is intentionally NOT reconciled here.
 // Callers needing drift reconciliation should call js.UpdateStream
@@ -219,6 +272,7 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 	}
 
 	backoff := o.baseBackoff
+	var insufficientPeersSince time.Time
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -226,7 +280,7 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 
 		// Lookup-first fast path.
 		if existing, err := js.Stream(ctx, cfg.Name); err == nil {
-			if isStreamPublishable(ctx, existing) {
+			if isStreamReady(ctx, existing) {
 				ensureReplicaScale(ctx, js, cfg.Name, desiredReplicas, o)
 				return existing, nil
 			}
@@ -247,11 +301,26 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 			// the handle and runs the publishable check.
 
 		case isInsufficientPeers(err) && o.fallbackOnInsufficientPeers && cfg.Replicas > EnsureFallbackReplicas:
-			logEvent(o.logger, "convergent: stream create rejected at default replica count, falling back to single replica",
-				zap.String("stream", cfg.Name),
-				zap.Int("attempted_replicas", cfg.Replicas),
-				zap.Error(err))
-			cfg.Replicas = EnsureFallbackReplicas
+			firstSeen := insufficientPeersSince.IsZero()
+			if firstSeen {
+				insufficientPeersSince = time.Now()
+			}
+			if time.Since(insufficientPeersSince) < o.insufficientPeersBudget {
+				if firstSeen {
+					logEvent(o.logger, "convergent: stream insufficient peers within bootstrap budget, retrying at requested replicas",
+						zap.String("stream", cfg.Name),
+						zap.Int("replicas", cfg.Replicas),
+						zap.Duration("budget", o.insufficientPeersBudget),
+						zap.Error(err))
+				}
+			} else {
+				logEvent(o.logger, "convergent: stream create rejected at default replica count, falling back to single replica",
+					zap.String("stream", cfg.Name),
+					zap.Int("attempted_replicas", cfg.Replicas),
+					zap.Duration("budget_elapsed", time.Since(insufficientPeersSince)),
+					zap.Error(err))
+				cfg.Replicas = EnsureFallbackReplicas
+			}
 
 		case isAlreadyInUse(err) || isTransientJetStreamError(err):
 
@@ -361,12 +430,16 @@ func ensureReplicaScale(ctx context.Context, js jetstream.JetStream, streamName 
 		zap.Int("to", desired))
 }
 
-// isStreamPublishable reports whether a JetStream stream can accept
-// publishes right now: leader elected is sufficient, regardless of whether
-// non-leader replicas are still catching up. Used by the lookup-first fast
-// path so cold-start doesn't stall on slow peer catch-up — the leader
-// alone can serve publishes while replicas converge in the background.
-func isStreamPublishable(ctx context.Context, stream jetstream.Stream) bool {
+// isStreamReady reports whether a JetStream stream can accept publishes
+// right now. For a clustered stream this means a leader is elected AND
+// every replica peer is online + caught up to the leader. For a non-
+// clustered (single-node) stream a non-nil StreamInfo is sufficient.
+//
+// The strict "all replicas Current" criterion matches plasma's original
+// pre-migration helper (pkg/event_manager/convergent.go @ 3b15498^) so
+// the migration path preserves that invariant; cold-start replica catch-
+// up is bounded by the cluster's Raft scheduling, not by this helper.
+func isStreamReady(ctx context.Context, stream jetstream.Stream) bool {
 	if stream == nil {
 		return false
 	}
@@ -377,18 +450,26 @@ func isStreamPublishable(ctx context.Context, stream jetstream.Stream) bool {
 	if info.Cluster == nil {
 		return true
 	}
-	return info.Cluster.Leader != ""
+	if info.Cluster.Leader == "" {
+		return false
+	}
+	for _, r := range info.Cluster.Replicas {
+		if r == nil || r.Offline || !r.Current {
+			return false
+		}
+	}
+	return true
 }
 
-// isJetStreamKVPublishable reports whether the KV_<bucket> stream that
-// backs a KV bucket has an elected leader (i.e., the bucket is writable
-// now). Mirrors isStreamPublishable for the KV lookup-first fast path.
-func isJetStreamKVPublishable(ctx context.Context, js jetstream.JetStream, bucket string) bool {
+// isJetStreamKVReady verifies the KV_<bucket> stream that backs a KV
+// bucket is ready to accept writes. Mirrors isStreamReady for the KV
+// lookup-first fast path.
+func isJetStreamKVReady(ctx context.Context, js jetstream.JetStream, bucket string) bool {
 	stream, err := js.Stream(ctx, "KV_"+bucket)
 	if err != nil {
 		return false
 	}
-	return isStreamPublishable(ctx, stream)
+	return isStreamReady(ctx, stream)
 }
 
 // isAlreadyInUse reports whether err indicates a concurrent peer has
@@ -440,9 +521,20 @@ func isInsufficientPeers(err error) bool {
 // err_code 10074 — those are placement failures, handled separately by
 // the replica-fallback path so the retry budget isn't burned on a state
 // the cluster cannot recover from.
+//
+// Matches both errors.Is-able sentinels from the classic nats.* package
+// (which the new jetstream v2 client still surfaces from the underlying
+// nats.Conn request layer — notably nats.ErrTimeout, whose Error() does
+// not match any of the substrings below) and the wrapped error strings
+// the new API returns through fmt.Errorf chains.
 func isTransientJetStreamError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, nats.ErrNoResponders) ||
+		errors.Is(err, nats.ErrNoStreamResponse) ||
+		errors.Is(err, nats.ErrTimeout) {
+		return true
 	}
 	if errors.Is(err, jetstream.ErrNoStreamResponse) {
 		return true
