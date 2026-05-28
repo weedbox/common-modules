@@ -309,10 +309,11 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 // Lookup-first: every iteration calls js.Stream to find an existing stream
 // before falling through to CreateOrUpdateStream. When the stream already
 // exists with an elected leader, the call returns without issuing an
-// update. This avoids forcing the server to re-validate (and on Replicas
-// drift, re-scale) the stream on every retry — a CreateOrUpdate-each-
-// iteration loop can stall for the full ctx budget against streams whose
-// scale-up to the requested replica count is gated by slow peer catch-up.
+// update unless subjects drift is detected (see below). This avoids
+// forcing the server to re-validate (and on Replicas drift, re-scale)
+// the stream on every retry — a CreateOrUpdate-each-iteration loop can
+// stall for the full ctx budget against streams whose scale-up to the
+// requested replica count is gated by slow peer catch-up.
 //
 // Multi-process safe semantics:
 //
@@ -328,9 +329,20 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 //     WithoutReplicaFallback(), or shorten / zero the budget via
 //     WithInsufficientPeersBudget().
 //
-// Config drift on an existing stream is intentionally NOT reconciled here.
-// Callers needing drift reconciliation should call js.UpdateStream
-// explicitly outside this helper.
+// Subjects-drift reconciliation: the lookup-first fast path compares the
+// existing stream's bound Subjects against cfg.Subjects as a set
+// (order-independent). On mismatch, the helper re-issues an idempotent
+// CreateOrUpdateStream to bring subjects in line with the request and
+// loops back to verify readiness. This closes the failure mode where an
+// upgrade changes a stream's subject filter but the lookup-first fast
+// path returns the stream with its old configuration unchanged — leaving
+// subsequent publishes to surface ErrNoStreamResponse because no stream
+// owns the new subject. An empty cfg.Subjects (mirror / source-only
+// streams) is treated as "no drift" and never triggers reconciliation.
+//
+// Other config drift (MaxBytes, MaxAge, Retention, Storage) is NOT
+// reconciled here. Callers needing those should issue an explicit
+// js.UpdateStream outside this helper.
 //
 // Returns the resolved Stream handle.
 func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.StreamConfig, opts ...EnsureOption) (jetstream.Stream, error) {
@@ -357,6 +369,51 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 		// Lookup-first fast path.
 		if existing, err := js.Stream(ctx, cfg.Name); err == nil {
 			if isStreamReady(ctx, existing) {
+				// Reconcile subjects drift before returning. An upgrade
+				// that changes a stream's subject filter would otherwise
+				// be a silent no-op here (existing handle has stale
+				// subjects), and subsequent publishes to the new subject
+				// would surface ErrNoStreamResponse because no stream
+				// owns them on the server.
+				drifted, existingCfg, driftErr := streamSubjectsDrifted(ctx, existing, cfg.Subjects)
+				if driftErr != nil {
+					// Drift unknown (Info hiccup). Sleep + retry rather
+					// than returning a stream whose subjects we never
+					// verified — the publish path is the next thing the
+					// caller will hit, and a stale-subject return makes
+					// that surface ErrNoStreamResponse.
+					if err := sleepBackoff(ctx, &backoff, o.maxBackoff); err != nil {
+						return nil, err
+					}
+					continue
+				}
+				if drifted {
+					// Reconcile subjects only: preserve the existing
+					// config's Replicas / MaxBytes / MaxAge / etc. so a
+					// single-node deployment whose existing R=1 stream
+					// drifts under a cfg requesting R=3 does not loop
+					// forever on insufficient-peers (the fast path
+					// skipped the create-side fallback machinery).
+					// EnsureReplicaScale on the next iteration still
+					// handles replica promotion when the cluster can.
+					reconcileCfg := existingCfg
+					reconcileCfg.Subjects = cfg.Subjects
+					logEvent(o.logger, "convergent: stream subjects drift detected, re-issuing CreateOrUpdate to reconcile",
+						zap.String("stream", cfg.Name),
+						zap.Strings("desired_subjects", cfg.Subjects),
+						zap.Strings("existing_subjects", existingCfg.Subjects))
+					if _, recoverErr := js.CreateOrUpdateStream(ctx, reconcileCfg); recoverErr != nil {
+						// Best-effort. Drift still holds, the next
+						// iteration's lookup will re-check.
+						logEvent(o.logger, "convergent: subjects-drift reconcile CreateOrUpdate returned error",
+							zap.String("stream", cfg.Name),
+							zap.Error(recoverErr))
+					}
+					if err := sleepBackoff(ctx, &backoff, o.maxBackoff); err != nil {
+						return nil, err
+					}
+					continue
+				}
 				ensureReplicaScale(ctx, js, cfg.Name, desiredReplicas, o)
 				return existing, nil
 			}
@@ -557,6 +614,55 @@ func isStreamReady(ctx context.Context, stream jetstream.Stream) bool {
 		}
 	}
 	return true
+}
+
+// streamSubjectsDrifted reports whether the existing stream's bound
+// Subjects differ from desired (set comparison, order-independent) and
+// returns the existing StreamConfig so the caller can build a reconcile
+// cfg that preserves server-side fields outside the drift check's scope
+// (Replicas, MaxBytes, MaxAge, Retention, etc.).
+//
+// Preserving Replicas in particular matters: the requested cfg may
+// carry a higher Replicas than the cluster can satisfy (e.g., R=3
+// against a single-node deployment). Re-issuing CreateOrUpdate at the
+// requested Replicas would surface "insufficient peers" indefinitely
+// because the fast path skipped the create-side fallback machinery;
+// using the existing config keeps subjects reconciliation atomic and
+// lets EnsureReplicaScale handle promotion separately.
+//
+// An empty desired set returns (false, zero cfg, nil) so callers that
+// omit cfg.Subjects (mirror / source-only streams whose ingress is
+// defined by Mirror / Sources) never trigger spurious reconciliation.
+// A stream.Info failure returns (false, zero cfg, err) so the caller
+// can treat drift as "unknown" transient and retry on the next
+// iteration rather than returning a stream whose subjects were never
+// verified.
+func streamSubjectsDrifted(ctx context.Context, stream jetstream.Stream, desired []string) (bool, jetstream.StreamConfig, error) {
+	var zero jetstream.StreamConfig
+	if len(desired) == 0 {
+		return false, zero, nil
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return false, zero, err
+	}
+	if info == nil {
+		return false, zero, nil
+	}
+	existing := info.Config.Subjects
+	if len(existing) != len(desired) {
+		return true, info.Config, nil
+	}
+	set := make(map[string]struct{}, len(existing))
+	for _, s := range existing {
+		set[s] = struct{}{}
+	}
+	for _, s := range desired {
+		if _, ok := set[s]; !ok {
+			return true, info.Config, nil
+		}
+	}
+	return false, info.Config, nil
 }
 
 // isJetStreamKVReady verifies the KV_<bucket> stream that backs a KV

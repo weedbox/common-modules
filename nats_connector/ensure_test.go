@@ -805,6 +805,257 @@ func TestEnsureKV_StuckRecoveryDoesNotInterfereWithFastPath(t *testing.T) {
 	}
 }
 
+// TestEnsureStream_SubjectsDriftReconciles seeds an existing stream with
+// one subject set, then calls EnsureStream with a different subject set
+// for the same stream name and verifies the lookup-first fast path
+// re-issues CreateOrUpdate so the server-side subjects converge on the
+// requested set. The pre-fix behaviour silently returned the existing
+// stream with stale subjects, leaving subsequent publishes to surface
+// ErrNoStreamResponse because no stream owned the new subject.
+func TestEnsureStream_SubjectsDriftReconciles(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	seedCfg := jetstream.StreamConfig{
+		Name:     "ensure_subjects_drift",
+		Subjects: []string{"old.subjects.>"},
+		Replicas: 1,
+	}
+	if _, err := EnsureStream(ctx, r.js, seedCfg); err != nil {
+		t.Fatalf("seed EnsureStream: %v", err)
+	}
+
+	core, logs := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
+
+	wantCfg := jetstream.StreamConfig{
+		Name:     "ensure_subjects_drift",
+		Subjects: []string{"new.subjects.>"},
+		Replicas: 1,
+	}
+	if _, err := EnsureStream(ctx, r.js, wantCfg, WithEnsureLogger(logger)); err != nil {
+		t.Fatalf("EnsureStream after drift: %v", err)
+	}
+
+	stream, err := r.js.Stream(ctx, "ensure_subjects_drift")
+	if err != nil {
+		t.Fatalf("post-ensure Stream lookup: %v", err)
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("post-ensure Stream Info: %v", err)
+	}
+	got := info.Config.Subjects
+	if len(got) != 1 || got[0] != "new.subjects.>" {
+		t.Fatalf("expected reconciled subjects [new.subjects.>], got %v", got)
+	}
+
+	// A publish to the new subject must succeed — confirms server-side
+	// subject binding (the actual root cause for the original bug).
+	if _, err := r.js.Publish(ctx, "new.subjects.hello", []byte("hi")); err != nil {
+		t.Fatalf("publish after reconcile: %v", err)
+	}
+
+	if logs.FilterMessageSnippet("subjects drift detected").Len() == 0 {
+		t.Fatalf("expected drift-detected log entry, got none (logs=%d)", logs.Len())
+	}
+}
+
+// TestEnsureStream_SubjectsDriftReconcileUsesExistingConfig directly
+// pins the contract of streamSubjectsDrifted: when drift is detected,
+// the returned config must be the existing stream's config (so the
+// caller can preserve Replicas / MaxBytes / MaxAge while overwriting
+// only Subjects), not the desired config.
+//
+// This is a regression guard for the single-node-stuck-loop bug:
+// before the fix, the drift path issued CreateOrUpdate with cfg as-is
+// (e.g. R=3) against a single-node server that already had the stream
+// at R=1. The server rejected every attempt with insufficient peers,
+// the fast path skipped the create-side replica fallback machinery, so
+// cfg.Replicas was never demoted, and every next iteration re-observed
+// the same drift and looped forever until ctx expired. The fix
+// reconciles off the existing config (preserving R=1) and only updates
+// the subjects field.
+//
+// The embedded test server accepts R=3 on a single node, so we can't
+// reproduce the looping behaviour end-to-end here — this test pins the
+// helper's return-value contract instead, which is the actual surface
+// where the bug lived.
+func TestEnsureStream_SubjectsDriftReconcileUsesExistingConfig(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	// Seed with a non-trivial existing config so we can verify the
+	// helper returns it verbatim (not just zero-valued defaults).
+	seedCfg := jetstream.StreamConfig{
+		Name:     "ensure_drift_helper_contract",
+		Subjects: []string{"stale.subjects.>"},
+		Replicas: 1,
+		MaxBytes: 1024 * 1024,
+		MaxAge:   2 * time.Hour,
+	}
+	if _, err := EnsureStream(ctx, r.js, seedCfg); err != nil {
+		t.Fatalf("seed EnsureStream: %v", err)
+	}
+
+	stream, err := r.js.Stream(ctx, seedCfg.Name)
+	if err != nil {
+		t.Fatalf("post-seed Stream lookup: %v", err)
+	}
+
+	drifted, existingCfg, err := streamSubjectsDrifted(ctx, stream, []string{"new.subjects.>"})
+	if err != nil {
+		t.Fatalf("streamSubjectsDrifted: %v", err)
+	}
+	if !drifted {
+		t.Fatalf("expected drifted=true for stale.subjects.> → new.subjects.>")
+	}
+	if got := existingCfg.Replicas; got != 1 {
+		t.Fatalf("expected existingCfg.Replicas=1 (preserved), got %d — caller must reconcile off this, not cfg", got)
+	}
+	if got := existingCfg.MaxBytes; got != 1024*1024 {
+		t.Fatalf("expected existingCfg.MaxBytes preserved, got %d", got)
+	}
+	if got := existingCfg.MaxAge; got != 2*time.Hour {
+		t.Fatalf("expected existingCfg.MaxAge preserved, got %v", got)
+	}
+	if got := existingCfg.Subjects; len(got) != 1 || got[0] != "stale.subjects.>" {
+		t.Fatalf("expected existingCfg.Subjects to still report stale subjects (caller overlays new ones), got %v", got)
+	}
+}
+
+// TestEnsureStream_SubjectsDriftEndToEndReconciles is the integration
+// counterpart: EnsureStream against an existing stream with stale
+// subjects must converge to the desired subjects within ctx, and the
+// "drift detected" log path must fire.
+func TestEnsureStream_SubjectsDriftEndToEndReconciles(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	if _, err := EnsureStream(ctx, r.js, jetstream.StreamConfig{
+		Name:     "ensure_drift_e2e",
+		Subjects: []string{"stale.subjects.>"},
+		Replicas: 1,
+	}); err != nil {
+		t.Fatalf("seed EnsureStream: %v", err)
+	}
+
+	core, logs := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
+
+	// 5s bound: a regression that loops on drift would manifest as ctx
+	// timeout rather than a hung suite.
+	driftCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	cfg := jetstream.StreamConfig{
+		Name:     "ensure_drift_e2e",
+		Subjects: []string{"new.subjects.>"},
+		Replicas: 1,
+	}
+	if _, err := EnsureStream(driftCtx, r.js, cfg,
+		WithEnsureLogger(logger),
+	); err != nil {
+		t.Fatalf("EnsureStream after drift: %v", err)
+	}
+
+	stream, err := r.js.Stream(ctx, "ensure_drift_e2e")
+	if err != nil {
+		t.Fatalf("post-ensure Stream lookup: %v", err)
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("post-ensure Stream Info: %v", err)
+	}
+	if got := info.Config.Subjects; len(got) != 1 || got[0] != "new.subjects.>" {
+		t.Fatalf("expected reconciled subjects [new.subjects.>], got %v", got)
+	}
+	if logs.FilterMessageSnippet("subjects drift detected").Len() == 0 {
+		t.Fatalf("expected drift-detected log entry")
+	}
+}
+
+// TestEnsureStream_SubjectsMatchNoReconcile confirms the drift check is
+// silent in the steady state: a second EnsureStream call with the same
+// subjects must fast-path without emitting a reconcile log or touching
+// CreateOrUpdate.
+func TestEnsureStream_SubjectsMatchNoReconcile(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	cfg := jetstream.StreamConfig{
+		Name:     "ensure_subjects_match",
+		Subjects: []string{"match.subjects.a", "match.subjects.b"},
+		Replicas: 1,
+	}
+	if _, err := EnsureStream(ctx, r.js, cfg); err != nil {
+		t.Fatalf("seed EnsureStream: %v", err)
+	}
+
+	core, logs := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
+
+	// Reverse the subject order to confirm set comparison ignores order.
+	reordered := jetstream.StreamConfig{
+		Name:     "ensure_subjects_match",
+		Subjects: []string{"match.subjects.b", "match.subjects.a"},
+		Replicas: 1,
+	}
+	start := time.Now()
+	if _, err := EnsureStream(ctx, r.js, reordered, WithEnsureLogger(logger)); err != nil {
+		t.Fatalf("EnsureStream second call: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("expected fast-path under 200ms, got %v — drift check may be misfiring on matching subjects", elapsed)
+	}
+	if logs.FilterMessageSnippet("subjects drift detected").Len() != 0 {
+		t.Fatalf("drift log should not fire on matching subjects; got %d entries", logs.Len())
+	}
+}
+
+// TestEnsureStream_EmptyDesiredSubjectsSkipsDriftCheck confirms that
+// callers omitting cfg.Subjects (mirror / source-only streams whose
+// ingress is defined by Mirror / Sources, not by subject filters) never
+// trigger drift reconciliation. Without this guard the fast path would
+// treat every such stream as drifted (existing.Subjects non-empty by
+// server defaults, desired empty) and CreateOrUpdate forever.
+func TestEnsureStream_EmptyDesiredSubjectsSkipsDriftCheck(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	// Seed a source stream so the aggregate has something to mirror.
+	if _, err := EnsureStream(ctx, r.js, jetstream.StreamConfig{
+		Name:     "ensure_drift_source",
+		Subjects: []string{"drift.source.>"},
+		Replicas: 1,
+	}); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+
+	aggCfg := jetstream.StreamConfig{
+		Name: "ensure_drift_aggregate",
+		Sources: []*jetstream.StreamSource{
+			{Name: "ensure_drift_source"},
+		},
+		Replicas: 1,
+		// Subjects intentionally omitted — aggregate ingress is via Sources.
+	}
+	if _, err := EnsureStream(ctx, r.js, aggCfg); err != nil {
+		t.Fatalf("seed aggregate: %v", err)
+	}
+
+	core, logs := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
+	if _, err := EnsureStream(ctx, r.js, aggCfg, WithEnsureLogger(logger)); err != nil {
+		t.Fatalf("EnsureStream second call: %v", err)
+	}
+	if logs.FilterMessageSnippet("subjects drift detected").Len() != 0 {
+		t.Fatalf("drift log should not fire when desired Subjects is empty; got %d entries", logs.Len())
+	}
+}
+
 // TestNATSConnector_EnsureOptsEnablesStuckRecoveryByDefault confirms the
 // method-form helpers wire WithStuckResourceRecovery
 // (DefaultStuckResourceRecoveryThreshold) by default. This is the only
