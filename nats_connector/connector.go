@@ -237,14 +237,31 @@ func (c *NATSConnector) GetJetStream() jetstream.JetStream {
 }
 
 // ensureOpts returns the EnsureOption set the method-form helpers apply
-// transparently: the connector's logger, plus a zero insufficient-peers
-// budget when the connected NATS server is not part of a cluster. The
-// budget is meant to absorb a fresh multi-node cluster's bootstrap
-// window — on a single-node deployment "insufficient peers" is permanent,
-// so paying the budget per call just multiplies startup latency without
-// any chance of recovery. Mirrors the single-node guard in lockReplicas.
+// transparently: the connector's logger, a zero insufficient-peers
+// budget when the connected NATS server is not part of a cluster, and
+// the stuck-resource recovery escape hatch with
+// DefaultStuckResourceRecoveryThreshold.
+//
+// The insufficient-peers budget is meant to absorb a fresh multi-node
+// cluster's bootstrap window — on a single-node deployment
+// "insufficient peers" is permanent, so paying the budget per call just
+// multiplies startup latency without any chance of recovery. Mirrors
+// the single-node guard in lockReplicas.
+//
+// The stuck-resource recovery default re-issues CreateOrUpdate after the
+// lookup-first fast path has observed a resource existing-but-not-ready
+// continuously for the threshold. Without it, a stream / KV stuck after
+// a previous crash (no leader electable, replicas offline) holds every
+// future starter at the lookup loop until ctx expires, which on plasma
+// surfaces as repeated pod restarts that never make progress. Re-issuing
+// CreateOrUpdate is idempotent for matching cfg and serialized by the
+// meta-leader, so the nudge is safe in steady state and effective in the
+// stuck case.
 func (c *NATSConnector) ensureOpts() []EnsureOption {
-	opts := []EnsureOption{WithEnsureLogger(c.logger)}
+	opts := []EnsureOption{
+		WithEnsureLogger(c.logger),
+		WithStuckResourceRecovery(DefaultStuckResourceRecoveryThreshold),
+	}
 	if c.conn != nil && c.conn.ConnectedClusterName() == "" {
 		opts = append(opts, WithInsufficientPeersBudget(0))
 	}

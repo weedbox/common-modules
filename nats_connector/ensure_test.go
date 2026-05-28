@@ -710,3 +710,115 @@ func TestEnsureKV_InsufficientPeersBudgetDelaysFallback(t *testing.T) {
 		t.Fatalf("expected total elapsed >= budget %v, got %v — fallback fired too early", budget, elapsed)
 	}
 }
+
+// TestEnsureOptions_StuckRecoveryDefaultDisabled verifies the package-level
+// helpers leave the stuck-resource recovery escape hatch disabled unless
+// the caller opts in. The method-form helpers set their own default via
+// (*NATSConnector).ensureOpts — covered by
+// TestNATSConnector_EnsureOptsEnablesStuckRecoveryByDefault below.
+func TestEnsureOptions_StuckRecoveryDefaultDisabled(t *testing.T) {
+	o := resolveEnsureOptions(nil)
+	if o.stuckRecoveryAfter != 0 {
+		t.Fatalf("expected package-level default stuckRecoveryAfter=0, got %v", o.stuckRecoveryAfter)
+	}
+}
+
+func TestEnsureOptions_StuckRecoveryAcceptsValue(t *testing.T) {
+	o := resolveEnsureOptions([]EnsureOption{WithStuckResourceRecovery(45 * time.Second)})
+	if o.stuckRecoveryAfter != 45*time.Second {
+		t.Fatalf("expected stuckRecoveryAfter=45s, got %v", o.stuckRecoveryAfter)
+	}
+}
+
+func TestEnsureOptions_StuckRecoveryNegativeClampedToZero(t *testing.T) {
+	o := resolveEnsureOptions([]EnsureOption{WithStuckResourceRecovery(-1 * time.Second)})
+	if o.stuckRecoveryAfter != 0 {
+		t.Fatalf("expected negative stuckRecoveryAfter clamped to 0, got %v", o.stuckRecoveryAfter)
+	}
+}
+
+// TestEnsureStream_StuckRecoveryDoesNotInterfereWithFastPath confirms the
+// escape hatch is silent in the steady state: a freshly created (ready)
+// stream is returned immediately on the second call, regardless of
+// WithStuckResourceRecovery setting. The embedded server cannot simulate
+// a wedged Raft group, so the recovery firing path itself is covered by
+// option-resolution tests above and by manual production verification.
+func TestEnsureStream_StuckRecoveryDoesNotInterfereWithFastPath(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	cfg := jetstream.StreamConfig{
+		Name:     "ensure_stuck_fastpath",
+		Subjects: []string{"ensure_stuck_fastpath.>"},
+		Replicas: 1,
+	}
+	if _, err := EnsureStream(ctx, r.js, cfg, WithStuckResourceRecovery(50*time.Millisecond)); err != nil {
+		t.Fatalf("EnsureStream first call: %v", err)
+	}
+
+	core, logs := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
+	start := time.Now()
+	if _, err := EnsureStream(ctx, r.js, cfg,
+		WithEnsureLogger(logger),
+		WithStuckResourceRecovery(50*time.Millisecond),
+	); err != nil {
+		t.Fatalf("EnsureStream second call: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("expected fast-path return well under 200ms, got %v — recovery loop may be firing on ready stream", elapsed)
+	}
+	if logs.FilterMessageSnippet("stuck not-ready beyond recovery threshold").Len() != 0 {
+		t.Fatalf("recovery log should not fire on a ready stream; got %d entries", logs.Len())
+	}
+}
+
+// TestEnsureKV_StuckRecoveryDoesNotInterfereWithFastPath mirrors the
+// stream-side fast-path guard for KV buckets.
+func TestEnsureKV_StuckRecoveryDoesNotInterfereWithFastPath(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	cfg := jetstream.KeyValueConfig{Bucket: "ensure_kv_stuck_fastpath", Replicas: 1}
+	if _, err := EnsureKV(ctx, r.js, cfg, WithStuckResourceRecovery(50*time.Millisecond)); err != nil {
+		t.Fatalf("EnsureKV first call: %v", err)
+	}
+
+	core, logs := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
+	start := time.Now()
+	if _, err := EnsureKV(ctx, r.js, cfg,
+		WithEnsureLogger(logger),
+		WithStuckResourceRecovery(50*time.Millisecond),
+	); err != nil {
+		t.Fatalf("EnsureKV second call: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("expected fast-path return well under 200ms, got %v — recovery loop may be firing on ready KV", elapsed)
+	}
+	if logs.FilterMessageSnippet("stuck not-ready beyond recovery threshold").Len() != 0 {
+		t.Fatalf("recovery log should not fire on a ready KV; got %d entries", logs.Len())
+	}
+}
+
+// TestNATSConnector_EnsureOptsEnablesStuckRecoveryByDefault confirms the
+// method-form helpers wire WithStuckResourceRecovery
+// (DefaultStuckResourceRecoveryThreshold) by default. This is the only
+// place plasma's resilience win against stuck-after-crash resources is
+// actually opted into — a regression that drops the option here would
+// silently revert the method-form behaviour to the lookup-first-only
+// blind spot.
+func TestNATSConnector_EnsureOptsEnablesStuckRecoveryByDefault(t *testing.T) {
+	r := newRig(t)
+	c := connectorOnRig(r)
+
+	o := resolveEnsureOptions(c.ensureOpts())
+	if o.stuckRecoveryAfter != DefaultStuckResourceRecoveryThreshold {
+		t.Fatalf("expected method-form default stuckRecoveryAfter=%v, got %v",
+			DefaultStuckResourceRecoveryThreshold, o.stuckRecoveryAfter)
+	}
+}

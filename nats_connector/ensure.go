@@ -37,6 +37,16 @@ const (
 	// election + per-stream Raft group formation on a 3-node cluster
 	// cold-start, while bounding single-node-deployment startup latency.
 	DefaultInsufficientPeersBudget = 30 * time.Second
+	// DefaultStuckResourceRecoveryThreshold is the recommended threshold
+	// for the lookup-first stuck-recovery escape hatch (see
+	// WithStuckResourceRecovery). Long enough that ordinary Raft
+	// re-election (typically 1-5 s) does not trigger it, short enough
+	// that a wedged resource is nudged well within a 5-minute
+	// provisioning context. Applied by default in the method-form
+	// helpers (*NATSConnector).EnsureStream / EnsureKV; the package-
+	// level helpers leave the escape hatch disabled unless the caller
+	// opts in via WithStuckResourceRecovery.
+	DefaultStuckResourceRecoveryThreshold = 30 * time.Second
 )
 
 // EnsureOption configures the convergent Ensure* helpers.
@@ -48,6 +58,7 @@ type ensureOptions struct {
 	maxBackoff                  time.Duration
 	fallbackOnInsufficientPeers bool
 	insufficientPeersBudget     time.Duration
+	stuckRecoveryAfter          time.Duration
 }
 
 func resolveEnsureOptions(opts []EnsureOption) ensureOptions {
@@ -68,6 +79,9 @@ func resolveEnsureOptions(opts []EnsureOption) ensureOptions {
 	}
 	if o.insufficientPeersBudget < 0 {
 		o.insufficientPeersBudget = 0
+	}
+	if o.stuckRecoveryAfter < 0 {
+		o.stuckRecoveryAfter = 0
 	}
 	return o
 }
@@ -111,6 +125,44 @@ func WithoutReplicaFallback() EnsureOption {
 // disables fallback entirely).
 func WithInsufficientPeersBudget(d time.Duration) EnsureOption {
 	return func(o *ensureOptions) { o.insufficientPeersBudget = d }
+}
+
+// WithStuckResourceRecovery enables an escape hatch for the lookup-first
+// fast path. By default, when EnsureStream / EnsureKV finds a stream or
+// KV bucket that already exists but is not publishable (no leader
+// elected, or some replicas offline / not current), it sleeps and
+// re-checks readiness without touching the server-side definition —
+// letting per-stream Raft settle on its own.
+//
+// That is correct for the common case (replicas catching up, transient
+// leader-flap, fresh cold-start Raft formation), but it is also a blind
+// spot: if a previous process or peer crash left the resource in a state
+// where Raft cannot elect a leader without external nudging, the loop
+// will spin until ctx expires. After a pod restart the next process
+// observes the same stuck resource and stalls again — never reaching the
+// recovery action the pre-lookup-first design used to perform every
+// iteration.
+//
+// With WithStuckResourceRecovery(after), once a continuous stuck-existing
+// observation has persisted for `after` duration, the helper re-issues
+// CreateOrUpdateStream / CreateOrUpdateKeyValue with the requested cfg.
+// CreateOrUpdate is idempotent for matching cfg and serialized by the
+// meta-leader, so the call is safe to repeat under load. The recovery
+// timer resets after each attempt so the helper does not spam the
+// server. Errors from the recovery CreateOrUpdate are logged (when a
+// logger is installed via WithEnsureLogger) but never aborted on — the
+// caller is still waiting for the resource to become ready and the next
+// lookup iteration may observe recovery from the nudge.
+//
+// Set to 0 to disable (default for the package-level helpers). Negative
+// values are clamped to 0. The method-form helpers
+// (*NATSConnector).EnsureStream / EnsureKV enable this by default with
+// DefaultStuckResourceRecoveryThreshold; callers that need to override
+// or disable it should drop down to the package-level form and pass an
+// explicit WithStuckResourceRecovery(...) (including
+// WithStuckResourceRecovery(0) to turn it off).
+func WithStuckResourceRecovery(after time.Duration) EnsureOption {
+	return func(o *ensureOptions) { o.stuckRecoveryAfter = after }
 }
 
 // EnsureKV provisions a JetStream KV bucket and blocks until the
@@ -165,6 +217,7 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 
 	backoff := o.baseBackoff
 	var insufficientPeersSince time.Time
+	var stuckSince time.Time
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -178,6 +231,25 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 			}
 			// Bucket exists but underlying stream has no elected leader —
 			// wait for Raft to settle instead of re-issuing CreateOrUpdate.
+			if stuckSince.IsZero() {
+				stuckSince = time.Now()
+			}
+			if o.stuckRecoveryAfter > 0 && time.Since(stuckSince) >= o.stuckRecoveryAfter {
+				logEvent(o.logger, "convergent: KV bucket stuck not-ready beyond recovery threshold, re-issuing CreateOrUpdate",
+					zap.String("bucket", cfg.Bucket),
+					zap.Duration("stuck_for", time.Since(stuckSince)),
+					zap.Duration("threshold", o.stuckRecoveryAfter))
+				if _, recoverErr := js.CreateOrUpdateKeyValue(ctx, cfg); recoverErr != nil {
+					// Nudge is best-effort; the original "exists but
+					// stuck" condition still holds, so keep waiting and
+					// let the next iteration's lookup observe whether
+					// the nudge unblocked Raft.
+					logEvent(o.logger, "convergent: stuck-KV recovery CreateOrUpdate returned error",
+						zap.String("bucket", cfg.Bucket),
+						zap.Error(recoverErr))
+				}
+				stuckSince = time.Now()
+			}
 			if err := sleepBackoff(ctx, &backoff, o.maxBackoff); err != nil {
 				return nil, err
 			}
@@ -185,6 +257,9 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 		} else if !errors.Is(err, jetstream.ErrBucketNotFound) && !isTransientJetStreamError(err) {
 			return nil, fmt.Errorf("lookup kv bucket %s: %w", cfg.Bucket, err)
 		}
+		// Either NotFound or transient — clear stuck tracking; we're
+		// heading back into the create path.
+		stuckSince = time.Time{}
 
 		_, err := js.CreateOrUpdateKeyValue(ctx, cfg)
 		switch {
@@ -273,6 +348,7 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 
 	backoff := o.baseBackoff
 	var insufficientPeersSince time.Time
+	var stuckSince time.Time
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -286,6 +362,25 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 			}
 			// Exists, leader still settling — wait for Raft instead of
 			// re-issuing CreateOrUpdate.
+			if stuckSince.IsZero() {
+				stuckSince = time.Now()
+			}
+			if o.stuckRecoveryAfter > 0 && time.Since(stuckSince) >= o.stuckRecoveryAfter {
+				logEvent(o.logger, "convergent: stream stuck not-ready beyond recovery threshold, re-issuing CreateOrUpdate",
+					zap.String("stream", cfg.Name),
+					zap.Duration("stuck_for", time.Since(stuckSince)),
+					zap.Duration("threshold", o.stuckRecoveryAfter))
+				if _, recoverErr := js.CreateOrUpdateStream(ctx, cfg); recoverErr != nil {
+					// Nudge is best-effort; the original "exists but
+					// stuck" condition still holds, so keep waiting and
+					// let the next iteration's lookup observe whether
+					// the nudge unblocked Raft.
+					logEvent(o.logger, "convergent: stuck-stream recovery CreateOrUpdate returned error",
+						zap.String("stream", cfg.Name),
+						zap.Error(recoverErr))
+				}
+				stuckSince = time.Now()
+			}
 			if err := sleepBackoff(ctx, &backoff, o.maxBackoff); err != nil {
 				return nil, err
 			}
@@ -293,6 +388,9 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 		} else if !errors.Is(err, jetstream.ErrStreamNotFound) && !isTransientJetStreamError(err) {
 			return nil, fmt.Errorf("lookup stream %s: %w", cfg.Name, err)
 		}
+		// Either NotFound or transient — clear stuck tracking; we're
+		// heading back into the create path.
+		stuckSince = time.Time{}
 
 		_, err := js.CreateOrUpdateStream(ctx, cfg)
 		switch {

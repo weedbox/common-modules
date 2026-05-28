@@ -380,6 +380,7 @@ stream, err := nats_connector.EnsureStream(ctx, js, cfg,
 - **Idempotency via `CreateOrUpdate`** — every helper calls `js.CreateOrUpdateKeyValue` / `js.CreateOrUpdateStream` / `stream.CreateOrUpdateConsumer`. The JetStream meta-leader serializes these by resource name, so concurrent callers across all replicas converge on the same final config without races.
 - **Transient error retry** — `"no responders"`, leadership-transferred, "stream in use", and timeout errors are classified as transient and retried with exponential backoff (default 200ms → 2s, capped per attempt). Non-transient errors (e.g. subjects overlap, conflicting config) are surfaced immediately.
 - **Replica fallback** — when the server replies `err_code 10074` (insufficient peers), the helper retries once with `Replicas=1`, logs a warning, and returns the single-node resource. This keeps single-node dev environments working with the same `Replicas=3` config used in production. Disable via `WithoutReplicaFallback()` to get a hard error instead.
+- **Stuck-resource recovery (escape hatch)** — `EnsureStream` / `EnsureKV` use a lookup-first fast path: if the resource already exists with an elected leader and current replicas, the call returns without touching the server-side definition. When the resource exists but is not publishable (no leader / replicas offline-or-not-current), the loop sleeps and re-checks readiness, trusting per-stream Raft to settle on its own. That is correct for transient cold-start and leader-flap, but is a blind spot when a prior process / peer crash left the resource in a state Raft cannot recover from without external nudging — the loop will then spin until `ctx` expires, and every subsequent process restart re-observes the same stuck state. With `WithStuckResourceRecovery(after)`, once a continuous stuck-existing observation has persisted for `after` duration the helper re-issues `CreateOrUpdateStream` / `CreateOrUpdateKeyValue` with the requested config (idempotent for matching cfg, serialized by the meta-leader). The timer resets after each attempt so the server is not spammed. The package-level helpers default to `0` (disabled, opt-in); the method-form helpers `(*NATSConnector).EnsureStream` / `EnsureKV` default to `DefaultStuckResourceRecoveryThreshold` (30s).
 - **`EnsureReplicaScale`** — best-effort. Reads current stream info, returns early if `desired ≤ 1` or current replicas already meet `desired`. Calls `UpdateStream` to promote replicas; logs and swallows any error. Use this when a topology change should make an existing stream more durable.
 - **Logger** — pass a `*zap.Logger` via `WithEnsureLogger(l)`. The method form auto-supplies the connector's logger. Nil logger is safe (logs are skipped).
 - **No state at this layer** — these helpers do not touch viper or any shared state. Backoff and replica behaviour are controlled per call via options.
@@ -587,6 +588,14 @@ Overrides the retry backoff window. `base` is the initial sleep between retries;
 #### `WithoutReplicaFallback() EnsureOption`
 
 Disables the silent demotion to `Replicas=1` when the cluster reports insufficient peers; surfaces the placement error instead.
+
+#### `WithInsufficientPeersBudget(d time.Duration) EnsureOption`
+
+Overrides how long `EnsureStream` / `EnsureKV` treat "insufficient peers" as a cluster-bootstrap transient (retrying at the requested replica count) before falling back to a single replica. `0` falls back immediately on the first occurrence. Default `DefaultInsufficientPeersBudget` (30s). No effect when combined with `WithoutReplicaFallback`.
+
+#### `WithStuckResourceRecovery(after time.Duration) EnsureOption`
+
+Enables the lookup-first **stuck-resource escape hatch**. After the helper has continuously observed an existing stream / KV bucket as not-publishable (no leader elected, or replicas offline / not current) for `after` duration, it re-issues `CreateOrUpdateStream` / `CreateOrUpdateKeyValue` with the requested config to nudge the server. CreateOrUpdate is idempotent for matching cfg and serialized by the meta-leader, so the call is safe to repeat under load. The recovery timer resets after each attempt so the server is not spammed. `0` disables the escape hatch (package-level default). Recommended value: `DefaultStuckResourceRecoveryThreshold` (30s). The method-form helpers `(*NATSConnector).EnsureStream` / `EnsureKV` enable this by default.
 
 ### WorkQueueConsumer
 
