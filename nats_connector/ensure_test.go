@@ -716,6 +716,118 @@ func TestEnsureKV_InsufficientPeersBudgetDelaysFallback(t *testing.T) {
 // the caller opts in. The method-form helpers set their own default via
 // (*NATSConnector).ensureOpts — covered by
 // TestNATSConnector_EnsureOptsEnablesStuckRecoveryByDefault below.
+func TestEnsureOptions_PerAttemptTimeoutDefault(t *testing.T) {
+	o := resolveEnsureOptions(nil)
+	if o.perAttemptTimeout != DefaultPerAttemptTimeout {
+		t.Fatalf("expected default perAttemptTimeout=%v, got %v", DefaultPerAttemptTimeout, o.perAttemptTimeout)
+	}
+}
+
+func TestEnsureOptions_PerAttemptTimeoutAcceptsValue(t *testing.T) {
+	o := resolveEnsureOptions([]EnsureOption{WithPerAttemptTimeout(5 * time.Second)})
+	if o.perAttemptTimeout != 5*time.Second {
+		t.Fatalf("expected perAttemptTimeout=5s, got %v", o.perAttemptTimeout)
+	}
+}
+
+func TestEnsureOptions_PerAttemptTimeoutNegativeClampedToZero(t *testing.T) {
+	o := resolveEnsureOptions([]EnsureOption{WithPerAttemptTimeout(-1 * time.Second)})
+	if o.perAttemptTimeout != 0 {
+		t.Fatalf("expected negative perAttemptTimeout clamped to 0, got %v", o.perAttemptTimeout)
+	}
+}
+
+// TestEnsureOptions_PerAttemptTimeoutZeroDisablesWrapping verifies the
+// disable-knob contract: WithPerAttemptTimeout(0) returns the caller's
+// ctx unchanged, restoring pre-fix behaviour for callers that explicitly
+// opt out (e.g., tests that need an unbounded synchronous RPC, or
+// deployments that have an upstream deadline strategy).
+func TestEnsureOptions_PerAttemptTimeoutZeroDisablesWrapping(t *testing.T) {
+	o := resolveEnsureOptions([]EnsureOption{WithPerAttemptTimeout(0)})
+
+	parent, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+
+	attempt, cancel := o.attemptCtx(parent)
+	defer cancel()
+
+	if attempt != parent {
+		t.Fatalf("expected parent ctx returned unchanged when perAttemptTimeout=0, got distinct ctx")
+	}
+	if _, hasDeadline := attempt.Deadline(); hasDeadline {
+		t.Fatalf("expected no deadline on disabled-wrap ctx, got one")
+	}
+}
+
+// TestEnsureOptions_PerAttemptTimeoutWrapsCtx verifies the enabled path
+// returns a derived ctx with the configured deadline.
+func TestEnsureOptions_PerAttemptTimeoutWrapsCtx(t *testing.T) {
+	o := resolveEnsureOptions([]EnsureOption{WithPerAttemptTimeout(250 * time.Millisecond)})
+
+	parent := context.Background()
+	attempt, cancel := o.attemptCtx(parent)
+	defer cancel()
+
+	deadline, hasDeadline := attempt.Deadline()
+	if !hasDeadline {
+		t.Fatalf("expected deadline on wrapped ctx")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > 250*time.Millisecond+50*time.Millisecond {
+		t.Fatalf("expected remaining ≈ 250ms, got %v", remaining)
+	}
+}
+
+// TestEnsureStream_PerAttemptTimeoutDoesNotInterfereWithFastPath confirms
+// the per-attempt wrap is silent in steady-state: a freshly-created
+// (ready) stream is returned immediately on the second call when the
+// option is set to a value that comfortably bounds healthy RPCs. The
+// embedded server cannot simulate a meta-leader dropping a reply, so
+// the recovery firing path itself is covered by option-resolution tests
+// above and by production verification of the multi-pod cold-start
+// race.
+func TestEnsureStream_PerAttemptTimeoutDoesNotInterfereWithFastPath(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	cfg := jetstream.StreamConfig{
+		Name:     "ensure_per_attempt_fastpath",
+		Subjects: []string{"ensure_per_attempt_fastpath.>"},
+		Replicas: 1,
+	}
+	if _, err := EnsureStream(ctx, r.js, cfg, WithPerAttemptTimeout(5*time.Second)); err != nil {
+		t.Fatalf("EnsureStream first call: %v", err)
+	}
+
+	start := time.Now()
+	if _, err := EnsureStream(ctx, r.js, cfg, WithPerAttemptTimeout(5*time.Second)); err != nil {
+		t.Fatalf("EnsureStream second call: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("expected fast-path return well under 500ms, got %v — per-attempt wrap may be interfering", elapsed)
+	}
+}
+
+// TestEnsureKV_PerAttemptTimeoutDoesNotInterfereWithFastPath mirrors the
+// stream-side guard for KV buckets.
+func TestEnsureKV_PerAttemptTimeoutDoesNotInterfereWithFastPath(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	cfg := jetstream.KeyValueConfig{Bucket: "ensure_kv_per_attempt_fastpath", Replicas: 1}
+	if _, err := EnsureKV(ctx, r.js, cfg, WithPerAttemptTimeout(5*time.Second)); err != nil {
+		t.Fatalf("EnsureKV first call: %v", err)
+	}
+
+	start := time.Now()
+	if _, err := EnsureKV(ctx, r.js, cfg, WithPerAttemptTimeout(5*time.Second)); err != nil {
+		t.Fatalf("EnsureKV second call: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("expected fast-path return well under 500ms, got %v — per-attempt wrap may be interfering", elapsed)
+	}
+}
+
 func TestEnsureOptions_StuckRecoveryDefaultDisabled(t *testing.T) {
 	o := resolveEnsureOptions(nil)
 	if o.stuckRecoveryAfter != 0 {

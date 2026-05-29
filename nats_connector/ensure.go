@@ -47,6 +47,23 @@ const (
 	// level helpers leave the escape hatch disabled unless the caller
 	// opts in via WithStuckResourceRecovery.
 	DefaultStuckResourceRecoveryThreshold = 30 * time.Second
+	// DefaultPerAttemptTimeout bounds each individual JetStream RPC
+	// (Stream / KeyValue lookup, CreateOrUpdate*, Stream.Info,
+	// UpdateStream) made from inside the Ensure* loop. A stalled RPC —
+	// most commonly the meta-leader dropping a reply during a multi-pod
+	// cold-start CreateOrUpdate race for the same stream name — would
+	// otherwise block the caller's outer ctx for its full budget
+	// (typically 5 min), because the convergent loop never observes the
+	// stall: the goroutine is blocked inside the JetStream client's
+	// synchronous request. Wrapping each RPC with a sub-context lets a
+	// dropped reply surface as context.DeadlineExceeded, which the
+	// transient classifier picks up and re-routes through the loop's
+	// backoff + retry, so the next attempt issues a fresh RPC. Sized to
+	// comfortably cover normal cold-start CreateOrUpdate latency on a
+	// healthy 3-node cluster (sub-second) plus headroom for per-stream
+	// Raft formation, while keeping recovery from a dropped reply at
+	// ~15s rather than ~5 min.
+	DefaultPerAttemptTimeout = 15 * time.Second
 )
 
 // EnsureOption configures the convergent Ensure* helpers.
@@ -59,6 +76,7 @@ type ensureOptions struct {
 	fallbackOnInsufficientPeers bool
 	insufficientPeersBudget     time.Duration
 	stuckRecoveryAfter          time.Duration
+	perAttemptTimeout           time.Duration
 }
 
 func resolveEnsureOptions(opts []EnsureOption) ensureOptions {
@@ -67,6 +85,7 @@ func resolveEnsureOptions(opts []EnsureOption) ensureOptions {
 		maxBackoff:                  DefaultEnsureMaxBackoff,
 		fallbackOnInsufficientPeers: true,
 		insufficientPeersBudget:     DefaultInsufficientPeersBudget,
+		perAttemptTimeout:           DefaultPerAttemptTimeout,
 	}
 	for _, fn := range opts {
 		fn(&o)
@@ -83,7 +102,21 @@ func resolveEnsureOptions(opts []EnsureOption) ensureOptions {
 	if o.stuckRecoveryAfter < 0 {
 		o.stuckRecoveryAfter = 0
 	}
+	if o.perAttemptTimeout < 0 {
+		o.perAttemptTimeout = 0
+	}
 	return o
+}
+
+// attemptCtx wraps parent with the configured per-attempt timeout so a
+// single stalled JetStream RPC does not block the convergent loop for
+// the full caller-ctx budget. When perAttemptTimeout <= 0 the caller's
+// ctx is returned unchanged (per-attempt timeouts disabled).
+func (o ensureOptions) attemptCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	if o.perAttemptTimeout <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, o.perAttemptTimeout)
 }
 
 // WithEnsureLogger installs a zap logger that receives structured-log
@@ -165,6 +198,26 @@ func WithStuckResourceRecovery(after time.Duration) EnsureOption {
 	return func(o *ensureOptions) { o.stuckRecoveryAfter = after }
 }
 
+// WithPerAttemptTimeout bounds each individual JetStream RPC made from
+// inside the Ensure* loop (Stream / KeyValue lookup, CreateOrUpdate*,
+// Stream.Info, UpdateStream). When the underlying request stalls — most
+// commonly the meta-leader dropping a reply during a multi-pod
+// cold-start CreateOrUpdate race for the same stream name — the wrapped
+// sub-context surfaces context.DeadlineExceeded, the transient
+// classifier picks it up, and the loop retries on the next backoff
+// tick. Without this bound, a single stalled RPC blocks the convergent
+// loop for the full caller-ctx budget (typically the 5-minute OnStart
+// provisioning window) because the goroutine is parked inside the
+// JetStream client's synchronous request and never observes the
+// supposed retry path.
+//
+// Set to 0 to disable per-attempt timeouts (caller ctx is the only
+// deadline; restores pre-fix behaviour). Negative values are clamped to
+// 0. Default DefaultPerAttemptTimeout.
+func WithPerAttemptTimeout(d time.Duration) EnsureOption {
+	return func(o *ensureOptions) { o.perAttemptTimeout = d }
+}
+
 // EnsureKV provisions a JetStream KV bucket and blocks until the
 // underlying KV_<bucket> stream is publishable, or ctx is done.
 //
@@ -224,8 +277,14 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 		}
 
 		// Lookup-first fast path.
-		if kv, err := js.KeyValue(ctx, cfg.Bucket); err == nil {
-			if isJetStreamKVReady(ctx, js, cfg.Bucket) {
+		lookupCtx, lookupCancel := o.attemptCtx(ctx)
+		kv, lookupErr := js.KeyValue(lookupCtx, cfg.Bucket)
+		lookupCancel()
+		if lookupErr == nil {
+			readyCtx, readyCancel := o.attemptCtx(ctx)
+			ready := isJetStreamKVReady(readyCtx, js, cfg.Bucket)
+			readyCancel()
+			if ready {
 				ensureReplicaScale(ctx, js, "KV_"+cfg.Bucket, desiredReplicas, o)
 				return kv, nil
 			}
@@ -239,7 +298,10 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 					zap.String("bucket", cfg.Bucket),
 					zap.Duration("stuck_for", time.Since(stuckSince)),
 					zap.Duration("threshold", o.stuckRecoveryAfter))
-				if _, recoverErr := js.CreateOrUpdateKeyValue(ctx, cfg); recoverErr != nil {
+				recCtx, recCancel := o.attemptCtx(ctx)
+				_, recoverErr := js.CreateOrUpdateKeyValue(recCtx, cfg)
+				recCancel()
+				if recoverErr != nil {
 					// Nudge is best-effort; the original "exists but
 					// stuck" condition still holds, so keep waiting and
 					// let the next iteration's lookup observe whether
@@ -254,14 +316,16 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 				return nil, err
 			}
 			continue
-		} else if !errors.Is(err, jetstream.ErrBucketNotFound) && !isTransientJetStreamError(err) {
-			return nil, fmt.Errorf("lookup kv bucket %s: %w", cfg.Bucket, err)
+		} else if !errors.Is(lookupErr, jetstream.ErrBucketNotFound) && !isTransientJetStreamError(lookupErr) {
+			return nil, fmt.Errorf("lookup kv bucket %s: %w", cfg.Bucket, lookupErr)
 		}
 		// Either NotFound or transient — clear stuck tracking; we're
 		// heading back into the create path.
 		stuckSince = time.Time{}
 
-		_, err := js.CreateOrUpdateKeyValue(ctx, cfg)
+		createCtx, createCancel := o.attemptCtx(ctx)
+		_, err := js.CreateOrUpdateKeyValue(createCtx, cfg)
+		createCancel()
 		switch {
 		case err == nil:
 			// Loop back so the next iteration's lookup-first path picks up
@@ -367,15 +431,23 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 		}
 
 		// Lookup-first fast path.
-		if existing, err := js.Stream(ctx, cfg.Name); err == nil {
-			if isStreamReady(ctx, existing) {
+		lookupCtx, lookupCancel := o.attemptCtx(ctx)
+		existing, lookupErr := js.Stream(lookupCtx, cfg.Name)
+		lookupCancel()
+		if lookupErr == nil {
+			readyCtx, readyCancel := o.attemptCtx(ctx)
+			ready := isStreamReady(readyCtx, existing)
+			readyCancel()
+			if ready {
 				// Reconcile subjects drift before returning. An upgrade
 				// that changes a stream's subject filter would otherwise
 				// be a silent no-op here (existing handle has stale
 				// subjects), and subsequent publishes to the new subject
 				// would surface ErrNoStreamResponse because no stream
 				// owns them on the server.
-				drifted, existingCfg, driftErr := streamSubjectsDrifted(ctx, existing, cfg.Subjects)
+				driftCtx, driftCancel := o.attemptCtx(ctx)
+				drifted, existingCfg, driftErr := streamSubjectsDrifted(driftCtx, existing, cfg.Subjects)
+				driftCancel()
 				if driftErr != nil {
 					// Drift unknown (Info hiccup). Sleep + retry rather
 					// than returning a stream whose subjects we never
@@ -402,7 +474,10 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 						zap.String("stream", cfg.Name),
 						zap.Strings("desired_subjects", cfg.Subjects),
 						zap.Strings("existing_subjects", existingCfg.Subjects))
-					if _, recoverErr := js.CreateOrUpdateStream(ctx, reconcileCfg); recoverErr != nil {
+					recCtx, recCancel := o.attemptCtx(ctx)
+					_, recoverErr := js.CreateOrUpdateStream(recCtx, reconcileCfg)
+					recCancel()
+					if recoverErr != nil {
 						// Best-effort. Drift still holds, the next
 						// iteration's lookup will re-check.
 						logEvent(o.logger, "convergent: subjects-drift reconcile CreateOrUpdate returned error",
@@ -427,7 +502,10 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 					zap.String("stream", cfg.Name),
 					zap.Duration("stuck_for", time.Since(stuckSince)),
 					zap.Duration("threshold", o.stuckRecoveryAfter))
-				if _, recoverErr := js.CreateOrUpdateStream(ctx, cfg); recoverErr != nil {
+				recCtx, recCancel := o.attemptCtx(ctx)
+				_, recoverErr := js.CreateOrUpdateStream(recCtx, cfg)
+				recCancel()
+				if recoverErr != nil {
 					// Nudge is best-effort; the original "exists but
 					// stuck" condition still holds, so keep waiting and
 					// let the next iteration's lookup observe whether
@@ -442,14 +520,16 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 				return nil, err
 			}
 			continue
-		} else if !errors.Is(err, jetstream.ErrStreamNotFound) && !isTransientJetStreamError(err) {
-			return nil, fmt.Errorf("lookup stream %s: %w", cfg.Name, err)
+		} else if !errors.Is(lookupErr, jetstream.ErrStreamNotFound) && !isTransientJetStreamError(lookupErr) {
+			return nil, fmt.Errorf("lookup stream %s: %w", cfg.Name, lookupErr)
 		}
 		// Either NotFound or transient — clear stuck tracking; we're
 		// heading back into the create path.
 		stuckSince = time.Time{}
 
-		_, err := js.CreateOrUpdateStream(ctx, cfg)
+		createCtx, createCancel := o.attemptCtx(ctx)
+		_, err := js.CreateOrUpdateStream(createCtx, cfg)
+		createCancel()
 		switch {
 		case err == nil:
 			// Loop back so the next iteration's lookup-first path picks up
@@ -507,7 +587,9 @@ func EnsureConsumer(ctx context.Context, stream jetstream.Stream, cfg jetstream.
 			return nil, err
 		}
 
-		consumer, err := stream.CreateOrUpdateConsumer(ctx, cfg)
+		attemptCtxCC, cancelCC := o.attemptCtx(ctx)
+		consumer, err := stream.CreateOrUpdateConsumer(attemptCtxCC, cfg)
+		cancelCC()
 		switch {
 		case err == nil:
 			return consumer, nil
@@ -550,11 +632,15 @@ func ensureReplicaScale(ctx context.Context, js jetstream.JetStream, streamName 
 	if ctx.Err() != nil {
 		return
 	}
-	stream, err := js.Stream(ctx, streamName)
+	lookupCtx, lookupCancel := o.attemptCtx(ctx)
+	stream, err := js.Stream(lookupCtx, streamName)
+	lookupCancel()
 	if err != nil {
 		return
 	}
-	info, err := stream.Info(ctx)
+	infoCtx, infoCancel := o.attemptCtx(ctx)
+	info, err := stream.Info(infoCtx)
+	infoCancel()
 	if err != nil || info == nil {
 		return
 	}
@@ -568,7 +654,10 @@ func ensureReplicaScale(ctx context.Context, js jetstream.JetStream, streamName 
 
 	cfg := info.Config
 	cfg.Replicas = desired
-	if _, err := js.UpdateStream(ctx, cfg); err != nil {
+	updateCtx, updateCancel := o.attemptCtx(ctx)
+	_, err = js.UpdateStream(updateCtx, cfg)
+	updateCancel()
+	if err != nil {
 		if isInsufficientPeers(err) || ctx.Err() != nil {
 			return
 		}
