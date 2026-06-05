@@ -78,7 +78,7 @@ func (a *APIs) healthz(c *gin.Context) {
 
 	if a.params.Daemon.GetHealthStatus() != daemon.HealthStatus_Healthy {
 
-		c.JSON(http.StatusInternalServerError, gin.H{
+		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"status": "unhealthy",
 		})
 
@@ -94,7 +94,7 @@ func (a *APIs) ready(c *gin.Context) {
 
 	if !a.params.Daemon.Ready() {
 
-		c.JSON(http.StatusInternalServerError, gin.H{
+		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"ready": false,
 		})
 
