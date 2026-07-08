@@ -3,7 +3,7 @@ module github.com/weedbox/common-modules
 go 1.25.0
 
 require (
-	github.com/Weedbox/scheduler v0.4.0
+	github.com/Weedbox/scheduler v0.6.0
 	github.com/gin-contrib/cors v1.7.6
 	github.com/gin-gonic/gin v1.11.0
 	github.com/go-redis/redis/v8 v8.11.5

@@ -2,20 +2,27 @@
 
 A common weedbox job scheduler module built on top of
 [`github.com/Weedbox/scheduler`](https://github.com/Weedbox/scheduler) and
-wired into [Uber Fx](https://github.com/uber-go/fx). Supports two backends:
+wired into [Uber Fx](https://github.com/uber-go/fx). Supports three backends:
 
 | Mode       | Backend                                             | Deployment                                  |
 |------------|-----------------------------------------------------|---------------------------------------------|
 | `gorm`     | `*gorm.DB` + in-memory timer                        | **Single node only**                        |
+| `postgres` | PostgreSQL 9.5+ claim-based scheduler (`FOR UPDATE SKIP LOCKED`) | Multi-instance coordinated through the shared database |
 | `nats`     | NATS 2.12+ JetStream Scheduled Message Delivery     | Multi-instance with KV-backed persistence   |
 
-The public API is identical in both modes — only `scheduler.mode` in config
+The public API is identical in all modes — only `scheduler.mode` in config
 changes.
 
 > ⚠️ **Important:** `gorm` mode uses an in-memory timer inside the process.
 > Running multiple replicas against the same database will cause **every
 > job to fire on every replica**. Do not deploy `gorm` mode with more than
-> one instance. Use `nats` mode for multi-node deployments.
+> one instance. Use `postgres` or `nats` mode for multi-node deployments.
+
+> 💡 `postgres` mode shares `gorm` mode's tables (two claim-coordination
+> columns are added on start), so a single-node `gorm` deployment on
+> PostgreSQL upgrades to multi-instance `postgres` mode in place — no data
+> migration. A typical setup runs `gorm` mode on SQLite in development and
+> `postgres` mode in production.
 
 ## Installation
 
@@ -27,7 +34,14 @@ go get github.com/weedbox/common-modules/scheduler
 
 ```toml
 [scheduler]
-mode = "gorm"      # or "nats"
+mode = "gorm"      # or "postgres" / "nats"
+
+# Only relevant in postgres mode — all optional (omit to use upstream defaults)
+# [scheduler.postgres]
+# pollInterval            = "1s"   # idle poll; bounds cross-instance pickup latency
+# leaseDuration           = "5m"   # claim lease; crashed instance's jobs recover after this
+# maxConcurrentExecutions = 32     # per-instance cap on in-flight handlers
+# execRecordTTL           = "720h" # prune execution records older than this (0 = keep forever)
 
 # Only relevant in nats mode
 [scheduler.nats]
@@ -53,7 +67,9 @@ execBucket    = "SCHEDULER_EXECUTIONS"
 
 In `gorm` mode the module also needs a
 [`database.DatabaseConnector`](../database/) to be provided (e.g.
-`sqlite_connector` or `postgres_connector`). In `nats` mode it needs
+`sqlite_connector` or `postgres_connector`). In `postgres` mode the same
+dependency applies, but the connector must be `postgres_connector` — the
+claim queries use PostgreSQL-specific SQL. In `nats` mode it needs
 [`nats_connector`](../nats_connector/); first-deploy provisioning of the
 stream, KV buckets, and durable consumer is handled internally by the
 upstream library's convergent-ensure primitives.
@@ -111,6 +127,23 @@ func main() {
 func doCleanup(ctx context.Context) error  { /* ... */ return nil }
 func flushMetrics(ctx context.Context) error { /* ... */ return nil }
 ```
+
+### PostgreSQL Mode (multi-instance)
+
+```go
+fx.New(
+    logger.Module(),
+    postgres_connector.Module("postgres"),
+    scheduler.Module("scheduler"),
+    // ... same SetHandler / EnsureJob invokes as above
+)
+```
+
+With `mode = "postgres"` any number of replicas coordinate through the
+shared database: each due job is claimed by exactly one instance via
+`FOR UPDATE SKIP LOCKED`, claims are lease-protected with automatic
+heartbeats, and a crashed replica's jobs are re-claimed by a peer once the
+lease expires. Delivery is at-least-once — keep handlers idempotent.
 
 ### NATS / JetStream Mode
 
@@ -231,6 +264,17 @@ Schedule constructors live in the underlying library; import
 - **`gorm` mode** is for single-node deployments (a worker, a single-process
   service, a CLI). Do not scale horizontally — timers fire independently in
   every process.
+- **`postgres` mode supports multi-instance deployments** without NATS. Due
+  jobs are claimed with a single `FOR UPDATE SKIP LOCKED` round-trip —
+  exactly one winner per tick, no leader election. Claims are leased and
+  heartbeated; a crashed replica's jobs are taken over once the lease
+  expires (`postgres.leaseDuration`, default 5m). The database clock is the
+  single time authority, so host clock skew cannot shift or duplicate
+  ticks. Cross-instance pickup latency for new/updated jobs is bounded by
+  `postgres.pollInterval` (default 1s).
+- **Delivery is at-least-once in `postgres` and `nats` modes — write
+  idempotent handlers.** Failover, lease expiry after a crash, and
+  reconciler repairs can all re-fire a tick in rare windows.
 - **`nats` mode** requires NATS Server **2.12 or later** with JetStream
   enabled. Startup will fail with `ErrNATSServerTooOld` on older servers.
 - On startup in NATS mode the library reloads jobs from the KV bucket and

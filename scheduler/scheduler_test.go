@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/weedbox/common-modules/database"
 	cmlogger "github.com/weedbox/common-modules/logger"
 	"github.com/weedbox/common-modules/nats_connector"
+	"github.com/weedbox/common-modules/postgres_connector"
 	"github.com/weedbox/common-modules/sqlite_connector"
 	"github.com/weedbox/weedbox/fxmodule"
 	"go.uber.org/fx"
@@ -654,5 +656,118 @@ func TestIntegration_NATSMode_ConcurrentInstances(t *testing.T) {
 	if total < 3 {
 		t.Fatalf("expected at least 3 total fires across two instances, got %d (A=%d, B=%d)",
 			total, atomic.LoadInt32(&callsA), atomic.LoadInt32(&callsB))
+	}
+}
+
+// --- Postgres mode ---
+
+func TestOnStart_PostgresModeRequiresDB(t *testing.T) {
+	viper.Reset()
+	defer viper.Reset()
+
+	viper.Set("scheduler.mode", ModePostgres)
+
+	m := newTestModule()
+	err := m.onStart(context.Background())
+	if !errors.Is(err, ErrModeNotConfigured) {
+		t.Fatalf("expected ErrModeNotConfigured, got %v", err)
+	}
+}
+
+// postgresTestConfig reads SCHEDULER_TEST_POSTGRES_DSN (same convention as the
+// upstream Weedbox/scheduler test suite), skips the test when unset, and maps
+// the DSN's key=value pairs onto postgres_connector's viper keys.
+//
+//	SCHEDULER_TEST_POSTGRES_DSN="host=localhost port=5432 user=postgres password=test dbname=postgres sslmode=disable" go test ./scheduler/
+func postgresTestConfig(t *testing.T, scope string) {
+	t.Helper()
+
+	dsn := os.Getenv("SCHEDULER_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("set SCHEDULER_TEST_POSTGRES_DSN to run postgres-mode tests")
+	}
+
+	for _, kv := range strings.Fields(dsn) {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "sslmode":
+			viper.Set(scope+".sslmode", v != "disable")
+		case "port":
+			viper.Set(scope+".port", v)
+		default:
+			viper.Set(scope+"."+k, v)
+		}
+	}
+}
+
+func TestIntegration_PostgresMode_HandlerFires(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	viper.Reset()
+	defer viper.Reset()
+	resetDBClaim(t)
+
+	postgresTestConfig(t, "postgres")
+	viper.Set("scheduler.mode", ModePostgres)
+	// Poll aggressively so the test converges quickly.
+	viper.Set("scheduler.postgres.pollInterval", "100ms")
+
+	var sm *SchedulerModule
+	var calls int32
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var once sync.Once
+
+	jobID := fmt.Sprintf("pg_heartbeat_%d", time.Now().UnixNano())
+
+	app := fx.New(
+		fx.NopLogger,
+		cmlogger.Module(),
+		postgres_connector.Module("postgres"),
+		Module("scheduler"),
+		fx.Populate(&sm),
+		fx.Invoke(func(s *SchedulerModule) {
+			s.SetHandler(func(ctx context.Context, e libsched.JobEvent) error {
+				if e.ID() == jobID {
+					atomic.AddInt32(&calls, 1)
+					once.Do(wg.Done)
+				}
+				return nil
+			})
+		}),
+		fx.Invoke(func(s *SchedulerModule) error {
+			sch, err := libsched.NewIntervalSchedule(500 * time.Millisecond)
+			if err != nil {
+				return err
+			}
+			return s.EnsureJob(jobID, sch, nil)
+		}),
+	)
+
+	startCtx, startCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer startCancel()
+	if err := app.Start(startCtx); err != nil {
+		t.Fatalf("fx start: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		if err := app.Stop(stopCtx); err != nil {
+			t.Fatalf("fx stop: %v", err)
+		}
+	}()
+
+	waitOrTimeout(t, &wg, 8*time.Second, "handler never fired")
+
+	if err := sm.RemoveJob(jobID); err != nil {
+		t.Fatalf("cleanup RemoveJob: %v", err)
+	}
+	if atomic.LoadInt32(&calls) < 1 {
+		t.Fatalf("expected handler to be called at least once")
 	}
 }

@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	ModeGorm = "gorm"
-	ModeNATS = "nats"
+	ModeGorm     = "gorm"
+	ModeNATS     = "nats"
+	ModePostgres = "postgres"
 
 	DefaultMode          = ModeGorm
 	DefaultStreamName    = "SCHEDULER"
@@ -156,6 +157,38 @@ func (m *SchedulerModule) natsOptionsFromConfig() []libsched.NATSSchedulerOption
 	return opts
 }
 
+// postgresOptionsFromConfig collects optional tuning knobs for the PostgreSQL
+// scheduler. Each key is only forwarded when the user has explicitly set it;
+// otherwise the underlying library's default is preserved. Durations accept
+// the usual viper-friendly forms ("30s", "5m", or a numeric nanosecond value).
+func (m *SchedulerModule) postgresOptionsFromConfig() []libsched.PostgresSchedulerOption {
+	type durOpt struct {
+		key  string
+		bind func(time.Duration) libsched.PostgresSchedulerOption
+	}
+
+	durations := []durOpt{
+		{"postgres.pollInterval", libsched.WithPostgresPollInterval},
+		{"postgres.leaseDuration", libsched.WithPostgresLeaseDuration},
+		{"postgres.execRecordTTL", libsched.WithPostgresExecRecordTTL},
+	}
+
+	var opts []libsched.PostgresSchedulerOption
+	for _, d := range durations {
+		path := m.getConfigPath(d.key)
+		if !viper.IsSet(path) {
+			continue
+		}
+		opts = append(opts, d.bind(viper.GetDuration(path)))
+	}
+
+	if path := m.getConfigPath("postgres.maxConcurrentExecutions"); viper.IsSet(path) {
+		opts = append(opts, libsched.WithPostgresMaxConcurrentExecutions(viper.GetInt(path)))
+	}
+
+	return opts
+}
+
 func (m *SchedulerModule) onStart(ctx context.Context) error {
 	mode := viper.GetString(m.getConfigPath("mode"))
 
@@ -183,7 +216,7 @@ func (m *SchedulerModule) onStart(ctx context.Context) error {
 			libsched.WithNATSSchedulerJobBucket(viper.GetString(m.getConfigPath("nats.jobBucket"))),
 			libsched.WithNATSSchedulerExecBucket(viper.GetString(m.getConfigPath("nats.execBucket"))),
 			libsched.WithNATSSchedulerCodec(m.codec),
-			libsched.WithNATSSchedulerLogger(zapNATSLogger(m.logger)),
+			libsched.WithNATSSchedulerLogger(zapKVLogger(m.logger)),
 		}
 		opts = append(opts, m.natsOptionsFromConfig()...)
 		sched = libsched.NewNATSScheduler(js, m.dispatch, opts...)
@@ -197,6 +230,20 @@ func (m *SchedulerModule) onStart(ctx context.Context) error {
 			return fmt.Errorf("%w: database not initialized", ErrModeNotConfigured)
 		}
 		sched = libsched.NewScheduler(libsched.NewGormStorage(gdb), m.dispatch, m.codec)
+
+	case ModePostgres:
+		if m.db == nil {
+			return fmt.Errorf("%w: postgres mode requires database connector", ErrModeNotConfigured)
+		}
+		gdb := m.db.GetDB()
+		if gdb == nil {
+			return fmt.Errorf("%w: database not initialized", ErrModeNotConfigured)
+		}
+		opts := []libsched.PostgresSchedulerOption{
+			libsched.WithPostgresSchedulerLogger(zapKVLogger(m.logger)),
+		}
+		opts = append(opts, m.postgresOptionsFromConfig()...)
+		sched = libsched.NewPostgresScheduler(gdb, m.dispatch, m.codec, opts...)
 
 	default:
 		return fmt.Errorf("scheduler: unknown mode %q", mode)
@@ -381,12 +428,13 @@ func copyMetadata(src map[string]string) map[string]string {
 	return dst
 }
 
-// zapNATSLogger adapts the upstream NATSSchedulerLogger callback (msg + flat
-// key/value pairs) onto a zap.Logger. Non-fatal errors from the NATS scheduler
-// (KV puts, next-tick publishes, reconciler hiccups) are emitted at warn
-// level. Without an adapter installed the upstream library drops them
-// silently.
-func zapNATSLogger(l *zap.Logger) libsched.NATSSchedulerLogger {
+// zapKVLogger adapts the upstream logger callback shape (msg + flat key/value
+// pairs, shared by NATSSchedulerLogger and SchedulerLogger) onto a zap.Logger.
+// Non-fatal background errors (KV puts, next-tick publishes, reconciler
+// hiccups, claim/write-back failures) are emitted at warn level. Without an
+// adapter installed the upstream library drops them silently. Returning the
+// bare func type lets it convert implicitly to either named type.
+func zapKVLogger(l *zap.Logger) func(msg string, keysAndValues ...any) {
 	return func(msg string, keysAndValues ...any) {
 		fields := make([]zap.Field, 0, len(keysAndValues)/2)
 		for i := 0; i+1 < len(keysAndValues); i += 2 {
