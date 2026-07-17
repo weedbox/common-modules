@@ -32,6 +32,11 @@ const (
 	DefaultMaxIdleConns    = 2 // database/sql defaultMaxIdleConns
 	DefaultConnMaxLifetime = 0 // seconds, 0 = no expiration
 	DefaultConnMaxIdleTime = 0 // seconds, 0 = no expiration
+
+	// Server-side per-session timeouts, sent as startup runtime parameters.
+	// 0 = not set (server/database defaults apply).
+	DefaultStatementTimeout = 0 // milliseconds
+	DefaultLockTimeout      = 0 // milliseconds
 )
 
 type PostgresConnector struct {
@@ -85,6 +90,8 @@ func (c *PostgresConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("max_idle_conns"), DefaultMaxIdleConns)
 	viper.SetDefault(c.getConfigPath("conn_max_lifetime"), DefaultConnMaxLifetime)
 	viper.SetDefault(c.getConfigPath("conn_max_idle_time"), DefaultConnMaxIdleTime)
+	viper.SetDefault(c.getConfigPath("statement_timeout"), DefaultStatementTimeout)
+	viper.SetDefault(c.getConfigPath("lock_timeout"), DefaultLockTimeout)
 }
 
 func (c *PostgresConnector) onStart(ctx context.Context) error {
@@ -103,6 +110,17 @@ func (c *PostgresConnector) onStart(ctx context.Context) error {
 		sslmode,
 	)
 
+	// pgx passes unrecognized DSN keys to the server as session runtime
+	// parameters, so these become per-connection GUCs (milliseconds).
+	statementTimeout := viper.GetInt(c.getConfigPath("statement_timeout"))
+	if statementTimeout > 0 {
+		dsn += fmt.Sprintf(" statement_timeout=%d", statementTimeout)
+	}
+	lockTimeout := viper.GetInt(c.getConfigPath("lock_timeout"))
+	if lockTimeout > 0 {
+		dsn += fmt.Sprintf(" lock_timeout=%d", lockTimeout)
+	}
+
 	maxOpenConns := viper.GetInt(c.getConfigPath("max_open_conns"))
 	maxIdleConns := viper.GetInt(c.getConfigPath("max_idle_conns"))
 	connMaxLifetime := viper.GetInt(c.getConfigPath("conn_max_lifetime"))
@@ -117,6 +135,8 @@ func (c *PostgresConnector) onStart(ctx context.Context) error {
 		zap.Int("max_idle_conns", maxIdleConns),
 		zap.Int("conn_max_lifetime", connMaxLifetime),
 		zap.Int("conn_max_idle_time", connMaxIdleTime),
+		zap.Int("statement_timeout", statementTimeout),
+		zap.Int("lock_timeout", lockTimeout),
 	)
 
 	// Default logger configuration
