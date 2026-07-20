@@ -224,7 +224,7 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 | `{scope}.dbname` | `default` | Database name |
 | `{scope}.user` | `postgres` | Database user |
 | `{scope}.password` | `""` | Database password |
-| `{scope}.sslmode` | `false` | Enable SSL connection |
+| `{scope}.sslmode` | `false` | SSL mode. Accepts a boolean (`true` → `require`, `false` → `disable`) or any libpq mode string: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`. Unknown values fail at startup. |
 | `{scope}.loglevel` | `4` (Error) | GORM log level (1=Silent, 2=Error, 3=Warn, 4=Info) |
 | `{scope}.debug_mode` | `false` | Enable debug mode with detailed SQL logging |
 | `{scope}.max_open_conns` | `0` | Maximum open connections in the pool. `0` means unlimited (Go `database/sql` default). Set a finite value (e.g. `50`) in production to avoid exhausting PostgreSQL's `max_connections`. |
@@ -241,7 +241,7 @@ port = 5432
 dbname = "myapp"
 user = "postgres"
 password = "secret"
-sslmode = false
+sslmode = false            # or a libpq mode string: "require", "verify-full", ...
 loglevel = 4
 debug_mode = false
 

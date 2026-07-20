@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
@@ -94,11 +95,36 @@ func (c *PostgresConnector) initDefaultConfigs() {
 	viper.SetDefault(c.getConfigPath("lock_timeout"), DefaultLockTimeout)
 }
 
+// resolveSSLMode maps the {scope}.sslmode config value onto a valid libpq
+// sslmode. The key was historically a bool, and the old code rendered true as
+// "enable" — not a libpq value, so enabling SSL always failed to connect.
+// Booleans (and their string spellings) now map to require/disable, and any
+// real libpq mode passes through for finer control. Unknown values are an
+// error so a typo surfaces at startup instead of silently downgrading SSL.
+func resolveSSLMode(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "false", "0", "off", "no", "disable":
+		return "disable", nil
+	case "true", "1", "on", "yes", "enable", "require":
+		return "require", nil
+	case "allow":
+		return "allow", nil
+	case "prefer":
+		return "prefer", nil
+	case "verify-ca":
+		return "verify-ca", nil
+	case "verify-full":
+		return "verify-full", nil
+	default:
+		return "", fmt.Errorf("invalid sslmode %q (want a boolean or one of disable/allow/prefer/require/verify-ca/verify-full)", value)
+	}
+}
+
 func (c *PostgresConnector) onStart(ctx context.Context) error {
 
-	sslmode := "disable"
-	if viper.GetBool(c.getConfigPath("sslmode")) {
-		sslmode = "enable"
+	sslmode, err := resolveSSLMode(viper.GetString(c.getConfigPath("sslmode")))
+	if err != nil {
+		return fmt.Errorf("%s: %w", c.getConfigPath("sslmode"), err)
 	}
 
 	dsn := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=%d sslmode=%s",
@@ -130,6 +156,7 @@ func (c *PostgresConnector) onStart(ctx context.Context) error {
 		zap.String("host", viper.GetString(c.getConfigPath("host"))),
 		zap.Int("port", viper.GetInt(c.getConfigPath("port"))),
 		zap.String("dbname", viper.GetString(c.getConfigPath("dbname"))),
+		zap.String("sslmode", sslmode),
 		zap.Int("loglevel", viper.GetInt(c.getConfigPath("loglevel"))),
 		zap.Int("max_open_conns", maxOpenConns),
 		zap.Int("max_idle_conns", maxIdleConns),
