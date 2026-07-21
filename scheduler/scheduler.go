@@ -249,7 +249,12 @@ func (m *SchedulerModule) onStart(ctx context.Context) error {
 		return fmt.Errorf("scheduler: unknown mode %q", mode)
 	}
 
-	if err := sched.Start(ctx); err != nil {
+	// The underlying schedulers derive their long-running loop context from the
+	// ctx given to Start. The fx OnStart ctx is only valid for the startup
+	// window (canceled or expired once the app finishes starting), so passing
+	// it directly kills every scheduler loop shortly after boot. Detach it;
+	// shutdown is driven explicitly by onStop → sched.Stop.
+	if err := sched.Start(context.WithoutCancel(ctx)); err != nil {
 		return fmt.Errorf("scheduler: failed to start: %w", err)
 	}
 	if err := sched.WaitUntilRunning(ctx); err != nil {
