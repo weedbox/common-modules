@@ -771,3 +771,69 @@ func TestIntegration_PostgresMode_HandlerFires(t *testing.T) {
 		t.Fatalf("expected handler to be called at least once")
 	}
 }
+
+// Regression: the scheduler loop must survive cancellation of the fx OnStart
+// context. fx cancels (or expires) the start context once the app finishes
+// starting; before the detach fix, every scheduler loop silently exited at
+// that point and no job ever fired again.
+func TestIntegration_GormMode_SurvivesStartContextCancel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	viper.Reset()
+	defer viper.Reset()
+	resetDBClaim(t)
+
+	dir := t.TempDir()
+	viper.Set("sqlite.path", filepath.Join(dir, "scheduler.db"))
+	viper.Set("scheduler.mode", ModeGorm)
+
+	var sm *SchedulerModule
+	var calls int32
+
+	app := fx.New(
+		fx.NopLogger,
+		cmlogger.Module(),
+		sqlite_connector.Module("sqlite"),
+		Module("scheduler"),
+		fx.Populate(&sm),
+		fx.Invoke(func(s *SchedulerModule) {
+			s.SetHandler(func(ctx context.Context, e libsched.JobEvent) error {
+				atomic.AddInt32(&calls, 1)
+				return nil
+			})
+		}),
+		fx.Invoke(func(s *SchedulerModule) error {
+			sch, err := libsched.NewIntervalSchedule(200 * time.Millisecond)
+			if err != nil {
+				return err
+			}
+			return s.EnsureJob("cancel_survivor", sch, nil)
+		}),
+	)
+
+	startCtx, startCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := app.Start(startCtx); err != nil {
+		startCancel()
+		t.Fatalf("fx start: %v", err)
+	}
+	// Simulate fx tearing down the start context right after startup completes.
+	startCancel()
+
+	// The job must keep firing well after the start context is gone.
+	base := atomic.LoadInt32(&calls)
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt32(&calls) < base+2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("scheduler loop died after start-context cancel: calls stuck at %d", atomic.LoadInt32(&calls))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := app.Stop(stopCtx); err != nil {
+		t.Fatalf("fx stop: %v", err)
+	}
+}
