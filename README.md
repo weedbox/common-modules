@@ -17,6 +17,7 @@ go get github.com/weedbox/common-modules
 | [configs](./configs) | Configuration management with Viper (TOML, environment variables) |
 | [logger](./logger) | Zap-based logging with debug mode support |
 | [daemon](./daemon) | Service lifecycle management with ready/health status |
+| [lifecycle](./lifecycle) | Application-level PostStart/PreStop phases (run hooks after all modules start / before any module stops) |
 
 ### HTTP
 
