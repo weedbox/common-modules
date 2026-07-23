@@ -91,6 +91,18 @@ type WorkQueueConfig struct {
 	// Zero values fall back to DefaultTransientBackoffBase / Max.
 	TransientBackoffBase time.Duration
 	TransientBackoffMax  time.Duration
+
+	// HandlerTimeout, when > 0, bounds how long a single handler invocation
+	// may run. The context passed to the handler carries this deadline, so any
+	// ctx-aware work it performs (database queries, outbound RPCs) is cancelled
+	// once it elapses; the handler then observes ctx.Done()/ctx.Err(), unwinds,
+	// and the message is nacked with backoff for retry. This guards against a
+	// wedged handler holding a resource (e.g. a DB connection) indefinitely.
+	//
+	// When zero (the default) no deadline is applied — the handler context is
+	// only cancelled on Shutdown, preserving the original behaviour. Existing
+	// callers that do not set this field are unaffected.
+	HandlerTimeout time.Duration
 }
 
 func init() {
@@ -116,6 +128,7 @@ func NewWorkQueueConsumerConfig() WorkQueueConfig {
 		IsTransientError:     nil, // Opt-in: callers wire their own classifier
 		TransientBackoffBase: DefaultTransientBackoffBase,
 		TransientBackoffMax:  DefaultTransientBackoffMax,
+		HandlerTimeout:       0, // Opt-in: zero means no deadline (legacy behaviour)
 	}
 }
 
@@ -241,9 +254,20 @@ func (wqc *WorkQueueConsumer) startConsuming(handler MessageHandler) (jetstream.
 	return consumeCtx, nil
 }
 
+// handlerContext derives the per-invocation context handed to a message or
+// batch handler. It is rooted at wqc.ctx, so Shutdown() always cancels it.
+// When config.HandlerTimeout > 0 the context additionally carries that
+// deadline; otherwise no deadline is applied (default / legacy behaviour).
+func (wqc *WorkQueueConsumer) handlerContext() (context.Context, context.CancelFunc) {
+	if wqc.config.HandlerTimeout > 0 {
+		return context.WithTimeout(wqc.ctx, wqc.config.HandlerTimeout)
+	}
+	return context.WithCancel(wqc.ctx)
+}
+
 func (wqc *WorkQueueConsumer) processMessage(msg jetstream.Msg, handler MessageHandler) {
 	// Create processing context, can be used to pass cancellation signals
-	processCtx, cancel := context.WithCancel(wqc.ctx)
+	processCtx, cancel := wqc.handlerContext()
 	defer cancel()
 
 	// According to MaxAwait to determine interval for sending in progress signal
@@ -519,7 +543,7 @@ func (wqc *WorkQueueConsumer) processBatch(msgs []jetstream.Msg, handler BatchMe
 		return
 	}
 
-	processCtx, cancel := context.WithCancel(wqc.ctx)
+	processCtx, cancel := wqc.handlerContext()
 	defer cancel()
 
 	interval := wqc.config.AckWait / 3
