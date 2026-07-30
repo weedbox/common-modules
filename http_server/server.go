@@ -139,7 +139,16 @@ func (hs *HTTPServer) onStart(ctx context.Context) error {
 	hs.router = gin.Default()
 
 	if logLevel == "prod" {
+		// "prod" drops gin's per-request access log, which is the only reason
+		// to pick it over "release" — services at production traffic already
+		// log requests through their own middleware. It must NOT also drop
+		// Recovery: gin.New() installs neither, so a panic in any handler
+		// unwinds past gin into net/http, which aborts the connection without
+		// a response. The client sees a broken connection rather than a 500,
+		// and the panic lands on the stdlib error log instead of the
+		// structured one. Keep the access log off; keep the safety net on.
 		hs.router = gin.New()
+		hs.router.Use(gin.Recovery())
 	}
 
 	// Setup Cors

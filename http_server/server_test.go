@@ -207,3 +207,51 @@ func TestServerStillServesNormalRequests(t *testing.T) {
 		t.Fatalf("got %d %q, want 200 \"pong\"", resp.StatusCode, body)
 	}
 }
+
+// TestProdLogLevelKeepsRecovery pins that "prod" only drops gin's access log,
+// not its panic recovery. Without Recovery a panicking handler unwinds into
+// net/http, which aborts the connection — the client gets no response at all
+// rather than a 500.
+func TestProdLogLevelKeepsRecovery(t *testing.T) {
+	hs, addr := newTestServer(t, map[string]any{"loglevel": "prod"})
+
+	hs.GetRouter().GET("/panic", func(c *gin.Context) {
+		panic("handler blew up")
+	})
+
+	resp, err := http.Get("http://" + addr + "/panic")
+	if err != nil {
+		t.Fatalf("request failed — the connection was aborted instead of answered, which is what Recovery prevents: %v", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
+	}
+}
+
+// TestProdLogLevelStillServesAfterAPanic: recovery must leave the server able
+// to answer the next request, which is the other half of what gin.New() lost.
+func TestProdLogLevelStillServesAfterAPanic(t *testing.T) {
+	hs, addr := newTestServer(t, map[string]any{"loglevel": "prod"})
+
+	hs.GetRouter().GET("/panic", func(c *gin.Context) { panic("boom") })
+	hs.GetRouter().GET("/ok", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	resp, err := http.Get("http://" + addr + "/panic")
+	if err == nil {
+		resp.Body.Close()
+	}
+
+	resp, err = http.Get("http://" + addr + "/ok")
+	if err != nil {
+		t.Fatalf("server stopped serving after a panic: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "ok" {
+		t.Errorf("got %d %q, want 200 \"ok\"", resp.StatusCode, string(body))
+	}
+}
