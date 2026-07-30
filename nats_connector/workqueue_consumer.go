@@ -42,6 +42,10 @@ const (
 	// Default values for transient-error backoff (fetch loop)
 	DefaultTransientBackoffBase = 500 * time.Millisecond
 	DefaultTransientBackoffMax  = 10 * time.Second
+
+	// DefaultShutdownTimeout bounds how long Shutdown waits for in-flight
+	// handlers after cancelling their context. See WorkQueueConfig.ShutdownTimeout.
+	DefaultShutdownTimeout = 30 * time.Second
 )
 
 type WorkQueueConsumer struct {
@@ -103,6 +107,25 @@ type WorkQueueConfig struct {
 	// only cancelled on Shutdown, preserving the original behaviour. Existing
 	// callers that do not set this field are unaffected.
 	HandlerTimeout time.Duration
+
+	// ShutdownTimeout bounds how long Shutdown waits for in-flight handlers
+	// after cancelling their context.
+	//
+	// Cancellation is only a request: a handler that ignores its context — a
+	// blocking call that took context.Background(), a driver that doesn't
+	// propagate cancellation, a plain wedge — keeps running, and an unbounded
+	// wait makes Shutdown block with it. Shutdown is normally called from a
+	// stop hook, so that one handler stops the entire process from exiting
+	// until the orchestrator's grace period runs out and SIGKILLs it — which
+	// skips every other component's cleanup, turning one stuck handler into a
+	// dirty shutdown for the whole service.
+	//
+	// Giving up on the wait is safe: the messages those handlers hold were
+	// never acked, so JetStream redelivers them after AckWait.
+	//
+	// Zero uses DefaultShutdownTimeout. Negative waits forever (the pre-0.0.61
+	// behaviour) for callers that would rather hang than proceed.
+	ShutdownTimeout time.Duration
 }
 
 func init() {
@@ -129,6 +152,7 @@ func NewWorkQueueConsumerConfig() WorkQueueConfig {
 		TransientBackoffBase: DefaultTransientBackoffBase,
 		TransientBackoffMax:  DefaultTransientBackoffMax,
 		HandlerTimeout:       0, // Opt-in: zero means no deadline (legacy behaviour)
+		ShutdownTimeout:      DefaultShutdownTimeout,
 	}
 }
 
@@ -658,14 +682,52 @@ func (wqc *WorkQueueConsumer) handleError(err error) {
 	}
 }
 
-// Graceful shutdown
+// Shutdown cancels the consumer and waits for in-flight handlers, bounded by
+// config.ShutdownTimeout. Handlers that outlive the wait are abandoned and the
+// timeout is reported through OnError; their messages are redelivered after
+// AckWait, since nothing acked them.
 func (wqc *WorkQueueConsumer) Shutdown() {
+	timeout := wqc.config.ShutdownTimeout
+	if timeout == 0 {
+		timeout = DefaultShutdownTimeout
+	}
+
+	if timeout < 0 {
+		wqc.cancel()
+		wqc.wg.Wait()
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := wqc.ShutdownContext(ctx); err != nil {
+		wqc.handleError(err)
+	}
+}
+
+// ShutdownContext cancels the consumer and waits for in-flight handlers until
+// they finish or ctx is done, whichever comes first. It returns ctx's error
+// when handlers were still running at that point, so a caller with its own
+// stop deadline (an fx OnStop hook, say) can decide what to do about it.
+func (wqc *WorkQueueConsumer) ShutdownContext(ctx context.Context) error {
 
 	// Cancel context
 	wqc.cancel()
 
-	// Wait for all goroutines to complete
-	wqc.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wqc.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("consumer %q shutdown gave up waiting for in-flight handlers: %w; their messages will be redelivered after AckWait",
+			wqc.config.ConsumerName, ctx.Err())
+	}
 }
 
 // Done returns a channel that is closed when the consumer context is cancelled.
