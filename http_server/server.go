@@ -20,7 +20,23 @@ const (
 	DefaultHeaders = "Authorization,Accept"
 	DefaultMethods = ""
 	DefaultOrigins = ""
-	DefaultMode = "test" // e.g. test, prod
+	DefaultMode    = "test" // e.g. test, prod
+
+	// DefaultReadHeaderTimeout bounds how long a connection may take to
+	// deliver its request headers. With no bound, a client that opens a
+	// socket and never finishes the header block pins a server goroutine and
+	// a file descriptor for the life of the process — the Slowloris shape,
+	// but just as easily a half-dead load balancer or a NAT that dropped the
+	// connection without a FIN. It covers the header phase only, so slow
+	// bodies (large multipart uploads) are unaffected.
+	DefaultReadHeaderTimeout = 20 * time.Second
+
+	// DefaultIdleTimeout bounds how long a keep-alive connection may sit
+	// between requests. net/http falls back to ReadTimeout when IdleTimeout
+	// is zero, and ReadTimeout is deliberately left unset here (see
+	// onStart), so leaving both unset means idle connections are never
+	// reaped.
+	DefaultIdleTimeout = 120 * time.Second
 )
 
 var logger *zap.Logger
@@ -80,10 +96,12 @@ func (hs *HTTPServer) initDefaultConfigs() {
 	viper.SetDefault(hs.getConfigPath("port"), DefaultPort)
 	viper.SetDefault(hs.getConfigPath("mode"), DefaultMode)
 
-
 	viper.SetDefault(hs.getConfigPath("allow_origins"), DefaultOrigins)
 	viper.SetDefault(hs.getConfigPath("allow_methods"), DefaultMethods)
 	viper.SetDefault(hs.getConfigPath("allow_headers"), DefaultHeaders)
+
+	viper.SetDefault(hs.getConfigPath("read_header_timeout"), DefaultReadHeaderTimeout)
+	viper.SetDefault(hs.getConfigPath("idle_timeout"), DefaultIdleTimeout)
 
 }
 
@@ -101,8 +119,13 @@ func (hs *HTTPServer) onStart(ctx context.Context) error {
 	allowMethods := viper.GetString(hs.getConfigPath("allow_methods"))
 	allowHeaders := viper.GetString(hs.getConfigPath("allow_headers"))
 
+	readHeaderTimeout := viper.GetDuration(hs.getConfigPath("read_header_timeout"))
+	idleTimeout := viper.GetDuration(hs.getConfigPath("idle_timeout"))
+
 	logger.Info("Starting HTTPServer",
 		zap.String("address", addr),
+		zap.Duration("read_header_timeout", readHeaderTimeout),
+		zap.Duration("idle_timeout", idleTimeout),
 	)
 
 	if logLevel == "test" {
@@ -147,9 +170,21 @@ func (hs *HTTPServer) onStart(ctx context.Context) error {
 
 	hs.router.Use(cors.New(corsConfig))
 
+	// ReadTimeout and WriteTimeout stay unset deliberately. Both are
+	// whole-request deadlines measured from the moment the connection is
+	// accepted, and consumers of this module serve responses that
+	// legitimately outlive any value we could pick here (SSE / streaming
+	// endpoints) as well as request bodies that do the same (large multipart
+	// uploads). ReadHeaderTimeout and IdleTimeout bound the two phases where
+	// no legitimate client is ever slow, which is what stops an abandoned or
+	// deliberately-stalled connection from being free to hold.
+	//
+	// Either can be set to 0 in config to restore the unbounded behaviour.
 	hs.server = &http.Server{
-		Addr:    addr,
-		Handler: hs.router,
+		Addr:              addr,
+		Handler:           hs.router,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
 	}
 
 	go func() {

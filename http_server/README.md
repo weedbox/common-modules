@@ -167,6 +167,19 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 | `{scope}.allow_origins` | `""` (allow all) | CORS allowed origins, comma-separated |
 | `{scope}.allow_methods` | `""` | CORS allowed HTTP methods, comma-separated |
 | `{scope}.allow_headers` | `Authorization,Accept` | CORS allowed headers, comma-separated |
+| `{scope}.read_header_timeout` | `20s` | Deadline for a connection to deliver its request headers. `0` disables it |
+| `{scope}.idle_timeout` | `120s` | How long a keep-alive connection may sit between requests. `0` disables it |
+
+### Connection timeouts
+
+`ReadHeaderTimeout` and `IdleTimeout` are set; `ReadTimeout` and `WriteTimeout`
+are deliberately **not**. The latter two are whole-request deadlines, so any
+value would also cap SSE / streaming responses and large multipart uploads.
+The two that are set cover the phases where no legitimate client is slow — so
+a connection that opens and never sends headers, or one abandoned mid
+keep-alive, no longer holds a goroutine and a file descriptor indefinitely.
+
+Set either key to `0` to restore the previous unbounded behaviour.
 
 ### TOML Configuration Example
 
@@ -179,6 +192,8 @@ loglevel = "release"
 allow_origins = "https://example.com,https://api.example.com"
 allow_methods = "GET,POST,PUT,DELETE"
 allow_headers = "Authorization,Accept,Content-Type"
+read_header_timeout = "20s"
+idle_timeout = "120s"
 ```
 
 ### Environment Variables Example
