@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -253,5 +254,140 @@ func TestProdLogLevelStillServesAfterAPanic(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || string(body) != "ok" {
 		t.Errorf("got %d %q, want 200 \"ok\"", resp.StatusCode, string(body))
+	}
+}
+
+// preflight sends a CORS preflight for the given method/headers and returns
+// the response, which is where the browser reads the allow-list from.
+func preflight(t *testing.T, addr, method, reqHeaders string) *http.Response {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodOptions, "http://"+addr+"/thing", nil)
+	if err != nil {
+		t.Fatalf("failed to build preflight: %v", err)
+	}
+	req.Header.Set("Origin", "https://console.example.com")
+	req.Header.Set("Access-Control-Request-Method", method)
+	if reqHeaders != "" {
+		req.Header.Set("Access-Control-Request-Headers", reqHeaders)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("preflight failed: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+
+	return resp
+}
+
+// TestAllowHeadersAppliesOutsideTestMode pins the fix for a silent production
+// failure: allow_headers used to be applied only when mode == "test", so a
+// release deployment fell back to cors.DefaultConfig's three headers and
+// every authenticated cross-origin request died in preflight — including the
+// module's own default of "Authorization".
+func TestAllowHeadersAppliesOutsideTestMode(t *testing.T) {
+	_, addr := newTestServer(t, map[string]any{
+		"mode":          "release",
+		"allow_headers": "Authorization,Range,X-Amz-Date",
+	})
+
+	resp := preflight(t, addr, http.MethodGet, "authorization,range,x-amz-date")
+
+	allowed := resp.Header.Get("Access-Control-Allow-Headers")
+	for _, want := range []string{"Authorization", "Range", "X-Amz-Date"} {
+		if !strings.Contains(allowed, want) {
+			t.Errorf("Access-Control-Allow-Headers = %q, missing %q", allowed, want)
+		}
+	}
+}
+
+// TestExposeHeadersAreAdvertised: a response header is invisible to browser
+// JavaScript unless it is named in Access-Control-Expose-Headers. Ranged
+// readers need Content-Range to know where in the object a 206 landed.
+//
+// Asserted on a REAL request, not a preflight: per the Fetch spec
+// Expose-Headers belongs to the actual response, and gin-contrib/cors does
+// not emit it on the OPTIONS answer.
+func TestExposeHeadersAreAdvertised(t *testing.T) {
+	hs, addr := newTestServer(t, map[string]any{
+		"mode":           "release",
+		"expose_headers": "Content-Range,ETag,Accept-Ranges",
+	})
+
+	hs.GetRouter().GET("/thing", func(c *gin.Context) { c.String(http.StatusOK, "x") })
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/thing", nil)
+	if err != nil {
+		t.Fatalf("failed to build request: %v", err)
+	}
+	req.Header.Set("Origin", "https://console.example.com")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	// Compared case-insensitively: gin-contrib/cors canonicalises the names
+	// it echoes back ("ETag" becomes "Etag"), and header names are
+	// case-insensitive to the browser either way.
+	exposed := strings.ToLower(resp.Header.Get("Access-Control-Expose-Headers"))
+	for _, want := range []string{"content-range", "etag", "accept-ranges"} {
+		if !strings.Contains(exposed, want) {
+			t.Errorf("Access-Control-Expose-Headers = %q, missing %q", exposed, want)
+		}
+	}
+}
+
+// TestExposeHeadersDefaultsToNone: the header must be absent when nothing is
+// configured, so this stays opt-in rather than leaking response metadata.
+// Checked on a real request for the same reason as the test above — a
+// preflight never carries Expose-Headers, so asserting there would pass
+// whatever the configuration said.
+func TestExposeHeadersDefaultsToNone(t *testing.T) {
+	hs, addr := newTestServer(t, map[string]any{"mode": "release"})
+
+	hs.GetRouter().GET("/thing", func(c *gin.Context) { c.String(http.StatusOK, "x") })
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/thing", nil)
+	if err != nil {
+		t.Fatalf("failed to build request: %v", err)
+	}
+	req.Header.Set("Origin", "https://console.example.com")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	if exposed := resp.Header.Get("Access-Control-Expose-Headers"); exposed != "" {
+		t.Errorf("Access-Control-Expose-Headers = %q, want it unset by default", exposed)
+	}
+}
+
+// TestCSVEntriesAreTrimmed: a natural "GET, POST" must not register " POST",
+// which would never match a real preflight.
+func TestCSVEntriesAreTrimmed(t *testing.T) {
+	_, addr := newTestServer(t, map[string]any{
+		"mode":          "release",
+		"allow_methods": "GET, DELETE,",
+		"allow_headers": "Authorization, X-Trace-Id,",
+	})
+
+	resp := preflight(t, addr, http.MethodDelete, "x-trace-id")
+
+	if allowed := resp.Header.Get("Access-Control-Allow-Methods"); !strings.Contains(allowed, "DELETE") {
+		t.Errorf("Access-Control-Allow-Methods = %q, missing DELETE", allowed)
+	}
+	allowed := resp.Header.Get("Access-Control-Allow-Headers")
+	if !strings.Contains(allowed, "X-Trace-Id") {
+		t.Errorf("Access-Control-Allow-Headers = %q, missing X-Trace-Id", allowed)
+	}
+	if strings.Contains(allowed, " X-Trace-Id") || strings.Contains(allowed, ",,") {
+		t.Errorf("Access-Control-Allow-Headers = %q, entries were not trimmed", allowed)
 	}
 }

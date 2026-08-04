@@ -22,6 +22,16 @@ const (
 	DefaultOrigins = ""
 	DefaultMode    = "test" // e.g. test, prod
 
+	// DefaultExposeHeaders is empty: a response header is invisible to
+	// browser JavaScript unless it is named here, and which ones a consumer
+	// needs is entirely application-specific. Anything serving ranged reads
+	// to a browser (an S3-compatible surface, a media endpoint) has to
+	// expose at least "Content-Range,Content-Length,ETag,Accept-Ranges" —
+	// without them the client can see the 206 but not where in the object
+	// it landed, so range-based readers fail in ways that look like a
+	// server bug rather than a CORS one.
+	DefaultExposeHeaders = ""
+
 	// DefaultReadHeaderTimeout bounds how long a connection may take to
 	// deliver its request headers. With no bound, a client that opens a
 	// socket and never finishes the header block pins a server goroutine and
@@ -91,6 +101,19 @@ func (hs *HTTPServer) getConfigPath(key string) string {
 	return fmt.Sprintf("%s.%s", hs.scope, key)
 }
 
+// appendCSV appends the comma-separated entries of csv to dst, trimming
+// surrounding whitespace and dropping empty entries — so a natural
+// "GET, POST" or a trailing comma cannot turn into a " POST" or "" header
+// name that silently never matches.
+func appendCSV(dst []string, csv string) []string {
+	for _, v := range strings.Split(csv, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			dst = append(dst, v)
+		}
+	}
+	return dst
+}
+
 func (hs *HTTPServer) initDefaultConfigs() {
 	viper.SetDefault(hs.getConfigPath("host"), DefaultHost)
 	viper.SetDefault(hs.getConfigPath("port"), DefaultPort)
@@ -99,6 +122,7 @@ func (hs *HTTPServer) initDefaultConfigs() {
 	viper.SetDefault(hs.getConfigPath("allow_origins"), DefaultOrigins)
 	viper.SetDefault(hs.getConfigPath("allow_methods"), DefaultMethods)
 	viper.SetDefault(hs.getConfigPath("allow_headers"), DefaultHeaders)
+	viper.SetDefault(hs.getConfigPath("expose_headers"), DefaultExposeHeaders)
 
 	viper.SetDefault(hs.getConfigPath("read_header_timeout"), DefaultReadHeaderTimeout)
 	viper.SetDefault(hs.getConfigPath("idle_timeout"), DefaultIdleTimeout)
@@ -111,13 +135,16 @@ func (hs *HTTPServer) onStart(ctx context.Context) error {
 	host := viper.GetString(hs.getConfigPath("host"))
 	addr := fmt.Sprintf("%s:%d", host, port)
 
-	mode := viper.GetString(hs.getConfigPath("mode"))
+	// NOTE: the "mode" key is no longer read. It used to gate allow_headers
+	// (see the Cors block below); the default is still registered so that
+	// existing config files carrying it keep loading without complaint.
 
 	logLevel := viper.GetString(hs.getConfigPath("loglevel"))
 
 	allowOrigins := viper.GetString(hs.getConfigPath("allow_origins"))
 	allowMethods := viper.GetString(hs.getConfigPath("allow_methods"))
 	allowHeaders := viper.GetString(hs.getConfigPath("allow_headers"))
+	exposeHeaders := viper.GetString(hs.getConfigPath("expose_headers"))
 
 	readHeaderTimeout := viper.GetDuration(hs.getConfigPath("read_header_timeout"))
 	idleTimeout := viper.GetDuration(hs.getConfigPath("idle_timeout"))
@@ -151,31 +178,27 @@ func (hs *HTTPServer) onStart(ctx context.Context) error {
 		hs.router.Use(gin.Recovery())
 	}
 
-	// Setup Cors
+	// Setup Cors. Each setting ADDS to what cors.DefaultConfig already
+	// permits (Origin/Content-Length/Content-Type, and the usual methods)
+	// rather than replacing it.
 	corsConfig := cors.DefaultConfig()
 
 	if allowOrigins != "" {
-		allows := strings.Split(allowOrigins, ",")
-		for _, a := range allows {
-			corsConfig.AllowOrigins = append(corsConfig.AllowOrigins, a)
-		}
+		corsConfig.AllowOrigins = appendCSV(corsConfig.AllowOrigins, allowOrigins)
 	} else {
 		corsConfig.AllowAllOrigins = true
 	}
-	if allowMethods != "" {
-		allows := strings.Split(allowMethods, ",")
-		for _, a := range allows {
-			corsConfig.AllowMethods = append(corsConfig.AllowMethods, a)
-		}
-	}
+	corsConfig.AllowMethods = appendCSV(corsConfig.AllowMethods, allowMethods)
 
-	// Add default or custom headers if in testing mode
-	if mode == "test" {
-		allows := strings.Split(allowHeaders, ",")
-		for _, a := range allows {
-			corsConfig.AllowHeaders = append(corsConfig.AllowHeaders, a)
-		}
-	}
+	// allow_headers applies in every mode. It used to be gated on
+	// mode == "test", which silently reduced production to the three
+	// headers cors.DefaultConfig ships with — so a configured
+	// "Authorization" (the default!) never reached the preflight response
+	// and any authenticated cross-origin request failed. Widening the
+	// preflight allow-list cannot break an existing caller: it only ever
+	// permits request headers that were previously rejected.
+	corsConfig.AllowHeaders = appendCSV(corsConfig.AllowHeaders, allowHeaders)
+	corsConfig.ExposeHeaders = appendCSV(corsConfig.ExposeHeaders, exposeHeaders)
 
 	hs.router.Use(cors.New(corsConfig))
 

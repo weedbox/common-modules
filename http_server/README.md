@@ -162,13 +162,43 @@ Configuration is managed via Viper. All config keys are prefixed with the module
 |-----|---------|-------------|
 | `{scope}.host` | `0.0.0.0` | Host address to listen on |
 | `{scope}.port` | `80` | Port number to listen on |
-| `{scope}.mode` | `test` | Running mode (`test` / `prod`) |
+| `{scope}.mode` | `test` | Running mode (`test` / `prod`). **No longer affects CORS**; see below |
 | `{scope}.loglevel` | - | Log level (`test` / `release` / `prod`) |
 | `{scope}.allow_origins` | `""` (allow all) | CORS allowed origins, comma-separated |
 | `{scope}.allow_methods` | `""` | CORS allowed HTTP methods, comma-separated |
-| `{scope}.allow_headers` | `Authorization,Accept` | CORS allowed headers, comma-separated |
+| `{scope}.allow_headers` | `Authorization,Accept` | CORS allowed **request** headers, comma-separated |
+| `{scope}.expose_headers` | `""` | CORS **response** headers made readable to browser JavaScript, comma-separated |
 | `{scope}.read_header_timeout` | `20s` | Deadline for a connection to deliver its request headers. `0` disables it |
 | `{scope}.idle_timeout` | `120s` | How long a keep-alive connection may sit between requests. `0` disables it |
+
+### CORS
+
+Every CORS setting **adds to** what `cors.DefaultConfig()` already permits
+(`Origin`, `Content-Length`, `Content-Type`, and the usual methods) rather
+than replacing it. Leaving `allow_origins` empty allows **all** origins.
+
+`allow_headers` names the **request** headers a cross-origin caller may send;
+`expose_headers` names the **response** headers the browser will let its
+JavaScript read. They are separate lists and a header usually belongs in only
+one of them.
+
+> **Behaviour change.** `allow_headers` used to be applied only when
+> `mode == "test"`. Any deployment running another mode silently fell back to
+> the three headers `cors.DefaultConfig()` ships with, so even the module's
+> own `Authorization` default never reached the preflight response and
+> authenticated cross-origin requests failed. It now applies in every mode.
+> This only ever widens what a preflight accepts, so it cannot break an
+> existing caller — but if you were relying on production rejecting those
+> headers, set `allow_headers` explicitly.
+
+Serving **ranged reads** to a browser (an S3-compatible surface, media
+endpoints) needs both lists filled in — without `Content-Range` exposed, the
+client can see the `206` but not where in the object it landed:
+
+```toml
+allow_headers  = "Authorization,Range,Content-Type"
+expose_headers = "Content-Range,Content-Length,ETag,Accept-Ranges"
+```
 
 ### Connection timeouts
 
