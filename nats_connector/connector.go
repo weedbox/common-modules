@@ -271,29 +271,29 @@ func (c *NATSConnector) ensureOpts() []EnsureOption {
 // EnsureKV provisions a JetStream KV bucket safely across multiple
 // instances. Method form of the package-level EnsureKV; supplies the
 // connector's JetStream handle and logger.
-func (c *NATSConnector) EnsureKV(ctx context.Context, cfg jetstream.KeyValueConfig) (jetstream.KeyValue, error) {
+func (c *NATSConnector) EnsureKV(ctx context.Context, cfg jetstream.KeyValueConfig, opts ...EnsureOption) (jetstream.KeyValue, error) {
 	if c.jsv2 == nil {
 		return nil, fmt.Errorf("nats jetstream not initialized")
 	}
-	return EnsureKV(ctx, c.jsv2, cfg, c.ensureOpts()...)
+	return EnsureKV(ctx, c.jsv2, cfg, append(c.ensureOpts(), opts...)...)
 }
 
 // EnsureStream provisions a JetStream stream safely across multiple
 // instances. Method form of the package-level EnsureStream.
-func (c *NATSConnector) EnsureStream(ctx context.Context, cfg jetstream.StreamConfig) (jetstream.Stream, error) {
+func (c *NATSConnector) EnsureStream(ctx context.Context, cfg jetstream.StreamConfig, opts ...EnsureOption) (jetstream.Stream, error) {
 	if c.jsv2 == nil {
 		return nil, fmt.Errorf("nats jetstream not initialized")
 	}
-	return EnsureStream(ctx, c.jsv2, cfg, c.ensureOpts()...)
+	return EnsureStream(ctx, c.jsv2, cfg, append(c.ensureOpts(), opts...)...)
 }
 
 // EnsureConsumer provisions a durable consumer on the given stream safely
 // across multiple instances. Method form of the package-level EnsureConsumer.
-func (c *NATSConnector) EnsureConsumer(ctx context.Context, stream jetstream.Stream, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error) {
+func (c *NATSConnector) EnsureConsumer(ctx context.Context, stream jetstream.Stream, cfg jetstream.ConsumerConfig, opts ...EnsureOption) (jetstream.Consumer, error) {
 	if c.jsv2 == nil {
 		return nil, fmt.Errorf("nats jetstream not initialized")
 	}
-	return EnsureConsumer(ctx, stream, cfg, c.ensureOpts()...)
+	return EnsureConsumer(ctx, stream, cfg, append(c.ensureOpts(), opts...)...)
 }
 
 // EnsureReplicaScale opportunistically promotes an existing stream toward

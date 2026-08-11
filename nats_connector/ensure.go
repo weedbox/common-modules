@@ -271,6 +271,7 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 	backoff := o.baseBackoff
 	var insufficientPeersSince time.Time
 	var stuckSince time.Time
+	var createConfirmPending bool
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -281,6 +282,7 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 		kv, lookupErr := js.KeyValue(lookupCtx, cfg.Bucket)
 		lookupCancel()
 		if lookupErr == nil {
+			createConfirmPending = false
 			readyCtx, readyCancel := o.attemptCtx(ctx)
 			ready := isJetStreamKVReady(readyCtx, js, cfg.Bucket)
 			readyCancel()
@@ -329,7 +331,15 @@ func EnsureKV(ctx context.Context, js jetstream.JetStream, cfg jetstream.KeyValu
 		switch {
 		case err == nil:
 			// Loop back so the next iteration's lookup-first path picks up
-			// the handle and runs the publishable check.
+			// the handle and runs the publishable check — immediately, not
+			// after a backoff window. See the note on createConfirmPending
+			// in EnsureStream: the sleep below is for retrying a call that
+			// did NOT succeed, and paying it here costs baseBackoff per
+			// first-time bucket on every cold start.
+			if !createConfirmPending {
+				createConfirmPending = true
+				continue
+			}
 
 		case isInsufficientPeers(err) && o.fallbackOnInsufficientPeers && cfg.Replicas > EnsureFallbackReplicas:
 			firstSeen := insufficientPeersSince.IsZero()
@@ -425,6 +435,9 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 	backoff := o.baseBackoff
 	var insufficientPeersSince time.Time
 	var stuckSince time.Time
+	// createConfirmPending guards the one iteration that follows a
+	// SUCCESSFUL CreateOrUpdateStream — see the err == nil case below.
+	var createConfirmPending bool
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -435,6 +448,7 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 		existing, lookupErr := js.Stream(lookupCtx, cfg.Name)
 		lookupCancel()
 		if lookupErr == nil {
+			createConfirmPending = false
 			readyCtx, readyCancel := o.attemptCtx(ctx)
 			ready := isStreamReady(readyCtx, existing)
 			readyCancel()
@@ -532,8 +546,24 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 		createCancel()
 		switch {
 		case err == nil:
-			// Loop back so the next iteration's lookup-first path picks up
-			// the handle and runs the publishable check.
+			// The server has accepted the definition, so the confirming
+			// lookup can run right now. The sleep at the bottom of the loop
+			// exists to space out attempts that did NOT succeed; paying it
+			// here charged every first-time create a full baseBackoff
+			// (200ms by default) before the loop was even allowed to look
+			// at what it had just created. A caller provisioning N streams
+			// and buckets at startup paid N × baseBackoff for nothing.
+			//
+			// Skipped for one iteration only: if the very next lookup still
+			// misses (create reported success but the resource is not
+			// visible — a disagreement this loop cannot resolve by
+			// spinning), createConfirmPending stays set and the normal
+			// backoff applies from then on, so this can never become a hot
+			// loop. Any lookup hit clears the flag.
+			if !createConfirmPending {
+				createConfirmPending = true
+				continue
+			}
 
 		case isInsufficientPeers(err) && o.fallbackOnInsufficientPeers && cfg.Replicas > EnsureFallbackReplicas:
 			firstSeen := insufficientPeersSince.IsZero()
