@@ -2,6 +2,7 @@ package nats_connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -31,7 +32,7 @@ const (
 	DefaultMaxAckPending = DefaultMaxConcurrent
 
 	// Default values for restart configuration
-	DefaultMaxRestarts      = -1              // Unlimited restarts
+	DefaultMaxRestarts      = -1 // Unlimited restarts
 	DefaultRestartBaseDelay = 1 * time.Second
 	DefaultRestartMaxDelay  = 30 * time.Second
 
@@ -59,13 +60,13 @@ type WorkQueueConsumer struct {
 }
 
 type WorkQueueConfig struct {
-	Conn          *nats.Conn
-	Stream        *nats.StreamInfo
-	ConsumerName  string
-	Subjects      []string
-	MaxConcurrent int
-	AckWait       time.Duration // Set ack wait time to prevent duplicate processing
-	MaxRetries    int
+	Conn             *nats.Conn
+	Stream           *nats.StreamInfo
+	ConsumerName     string
+	Subjects         []string
+	MaxConcurrent    int
+	AckWait          time.Duration // Set ack wait time to prevent duplicate processing
+	MaxRetries       int
 	MaxAckPending    int
 	OnError          ErrorHandler
 	MaxRestarts      int           // Max restart attempts; -1 unlimited, 0 no restart
@@ -95,6 +96,24 @@ type WorkQueueConfig struct {
 	// Zero values fall back to DefaultTransientBackoffBase / Max.
 	TransientBackoffBase time.Duration
 	TransientBackoffMax  time.Duration
+
+	// DeliverPolicy selects where a durable consumer starts reading, and is
+	// honoured ONLY when the consumer is created for the first time. The server
+	// refuses to change it afterwards ("deliver policy can not be updated"), so
+	// ensureConsumer reads the live value off an existing consumer and reuses
+	// it rather than sending a conflicting one — a restart is never a policy
+	// change, whatever this field says.
+	//
+	// Nil (the default) means DeliverLastPolicy, the long-standing behaviour:
+	// a brand-new consumer starts at the last message matching its filter and
+	// ignores the stream's history. Set it to DeliverAllPolicy for a consumer
+	// whose messages are work orders rather than state — anything published
+	// before it first existed is work that would otherwise be silently lost.
+	//
+	// A pointer, not a plain value, precisely because the zero value of
+	// jetstream.DeliverPolicy IS DeliverAllPolicy: an unset field has to keep
+	// meaning "last" for every existing caller.
+	DeliverPolicy *jetstream.DeliverPolicy
 
 	// HandlerTimeout, when > 0, bounds how long a single handler invocation
 	// may run. The context passed to the handler carries this deadline, so any
@@ -187,13 +206,30 @@ func (wqc *WorkQueueConsumer) ensureConsumer(config WorkQueueConfig) error {
 	// Consumer configuration
 	consumerConfig := jetstream.ConsumerConfig{
 		Name:           config.ConsumerName,
-		Durable:        config.ConsumerName,          // Make consumer durable to survive subscription disconnects
+		Durable:        config.ConsumerName, // Make consumer durable to survive subscription disconnects
 		FilterSubjects: config.Subjects,
 		AckPolicy:      jetstream.AckExplicitPolicy, // Require explicit ack
 		AckWait:        config.AckWait,              // Set ack wait time
 		MaxDeliver:     config.MaxRetries + 1,       // Maximum retry count
-		DeliverPolicy:  jetstream.DeliverLastPolicy,
+		DeliverPolicy:  deliverPolicyOrDefault(config.DeliverPolicy),
 		MaxAckPending:  config.MaxAckPending,
+	}
+
+	// DeliverPolicy is fixed at creation: the server answers a changed one with
+	// "deliver policy can not be updated" (500/10012), which would turn every
+	// restart after a policy change into a startup failure. Adopt whatever the
+	// existing consumer already has, so this call only ever updates the fields
+	// that ARE updatable.
+	if existing, err := wqc.js.Consumer(wqc.ctx, config.Stream.Config.Name, config.ConsumerName); err == nil {
+		info, err := existing.Info(wqc.ctx)
+		if err != nil {
+			return fmt.Errorf("failed to read existing consumer: %w", err)
+		}
+		consumerConfig.DeliverPolicy = info.Config.DeliverPolicy
+		consumerConfig.OptStartSeq = info.Config.OptStartSeq
+		consumerConfig.OptStartTime = info.Config.OptStartTime
+	} else if !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		return fmt.Errorf("failed to look up consumer: %w", err)
 	}
 
 	consumer, err := wqc.js.CreateOrUpdateConsumer(wqc.ctx, config.Stream.Config.Name, consumerConfig)
@@ -204,6 +240,15 @@ func (wqc *WorkQueueConsumer) ensureConsumer(config WorkQueueConfig) error {
 	wqc.consumer = consumer
 
 	return nil
+}
+
+// deliverPolicyOrDefault keeps an unset DeliverPolicy meaning DeliverLastPolicy.
+// It cannot be expressed as a zero value: jetstream.DeliverAllPolicy is 0.
+func deliverPolicyOrDefault(p *jetstream.DeliverPolicy) jetstream.DeliverPolicy {
+	if p == nil {
+		return jetstream.DeliverLastPolicy
+	}
+	return *p
 }
 
 // Start consuming messages
