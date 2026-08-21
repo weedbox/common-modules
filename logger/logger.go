@@ -20,7 +20,28 @@ func Module() fx.Option {
 	return fx.Options(
 		fx.Provide(SetupLogger),
 		fx.WithLogger(func(l *zap.Logger) fxevent.Logger {
-			return &fxevent.ZapLogger{Logger: l}
+			fxLogger := &fxevent.ZapLogger{Logger: l}
+
+			// Demote fx's routine lifecycle events (provided / invoking /
+			// OnStart hook executed / ...) to Debug. They are one line per
+			// constructor and per hook, which floods startup in any non-trivial
+			// app — the reason applications kept reaching for fx.NopLogger.
+			//
+			// Only the non-error path is demoted. fxevent.ZapLogger routes every
+			// event with a non-nil Err through logError (Error level) and every
+			// other event through logEvent (this level), so startup failures stay
+			// visible while the noise disappears at the default Info threshold.
+			//
+			// This matters more than it looks: fx's App.run() discards the error
+			// returned by app.Start and just exits 1, so the fxevent.Logger is the
+			// ONLY channel through which a startup failure is ever reported.
+			// With fx.NopLogger the process dies with an empty log.
+			//
+			// DEBUG_MODE=true lowers the zap level to Debug and the full fx event
+			// stream comes back — no separate verbose flag needed.
+			fxLogger.UseLogLevel(zapcore.DebugLevel)
+
+			return fxLogger
 		}),
 	)
 }
